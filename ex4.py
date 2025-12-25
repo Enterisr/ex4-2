@@ -49,20 +49,77 @@ def read_video_frames(path: Path, max_frames: Optional[int] = None, stride: int 
     return frames
 
 
+def harris_corners(
+    gray: np.ndarray,
+    max_features: int,
+    quality_level: float,
+    min_distance: int,
+    block_size: int,
+    k: float = 0.04,
+) -> np.ndarray:
+    """Manual Harris detector with simple non-max suppression and distance pruning."""
+    g = gray.astype(np.float32)
+    Ix = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    Iy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+
+    Ixx = Ix * Ix
+    Iyy = Iy * Iy
+    Ixy = Ix * Iy
+
+    Sxx = cv2.GaussianBlur(Ixx, (block_size, block_size), 0)
+    Syy = cv2.GaussianBlur(Iyy, (block_size, block_size), 0)
+    Sxy = cv2.GaussianBlur(Ixy, (block_size, block_size), 0)
+
+    R = (Sxx * Syy - Sxy * Sxy) - k * (Sxx + Syy) ** 2
+    R[R < 0] = 0
+    if R.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    R_max = float(R.max())
+    if not np.isfinite(R_max) or R_max <= 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    thresh = quality_level * R_max
+    mask = R >= thresh
+    if not np.any(mask):
+        return np.empty((0, 2), dtype=np.float32)
+
+    dilated = cv2.dilate(R, None)
+    peaks = (R == dilated) & mask
+    ys, xs = np.nonzero(peaks)
+    scores = R[ys, xs]
+    if len(scores) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    order = np.argsort(scores)[::-1]
+    pts: List[Tuple[int, int]] = []
+    min_dist2 = float(min_distance * min_distance)
+    for idx in order:
+        y = int(ys[idx])
+        x = int(xs[idx])
+        if all((x - px) * (x - px) + (y - py) * (y - py) >= min_dist2 for px, py in pts):
+            pts.append((x, y))
+            if len(pts) >= max_features:
+                break
+
+    if not pts:
+        return np.empty((0, 2), dtype=np.float32)
+    return np.array(pts, dtype=np.float32)
+
+
 def detect_and_match(gray_a: np.ndarray, gray_b: np.ndarray, max_features: int = 2000, keep: int = 400) -> Tuple[np.ndarray, np.ndarray]:
-    """Track Shi-Tomasi corners with LK instead of descriptor matching."""
-    corners = cv2.goodFeaturesToTrack(
+    """Track manual Harris corners with LK instead of descriptor matching."""
+    corners = harris_corners(
         gray_a,
-        maxCorners=max_features,
-        qualityLevel=0.01,
-        minDistance=6,
-        blockSize=7,
-        useHarrisDetector=False,
+        max_features=max_features,
+        quality_level=0.01,
+        min_distance=6,
+        block_size=7,
     )
-    if corners is None or len(corners) < 4:
+    if len(corners) < 4:
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
 
-    pts_prev = corners.squeeze(1).astype(np.float32)
+    pts_prev = corners.astype(np.float32)
     pts_next, status, err = cv2.calcOpticalFlowPyrLK(
         gray_a,
         gray_b,
@@ -243,11 +300,13 @@ def render_strip_sweep_video(
     h, w = first.shape[:2]
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+    if not writer.isOpened():
+        print(f"Warning: failed to open sweep VideoWriter for {output_path} at size {w}x{h}; skipping sweep video")
+        return
 
     writer.write(first)
 
-    def gen(idx_center: Tuple[int, float]) -> Tuple[int, np.ndarray]:
-        idx, center_ratio = idx_center
+    for center_ratio in progress_iter(centers[1:], total=len(centers) - 1, desc="Sweep video"):
         mosaic = build_mosaic(
             frames,
             transforms,
@@ -257,21 +316,7 @@ def render_strip_sweep_video(
             strip_center_ratio=center_ratio,
             vertical_scale=vertical_scale,
         )
-        return idx, mosaic
-
-    # Threaded generation to speed up sweep without reducing quality
-    pending: dict[int, np.ndarray] = {}
-    next_idx = 1
-    tasks = list(enumerate(centers[1:], start=1))
-    max_workers = max(1, min(os.cpu_count() or 1, 8))
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(gen, t) for t in tasks]
-        for fut in progress_iter(as_completed(futures), total=len(futures), desc="Sweep video"):
-            idx, mosaic = fut.result()
-            pending[idx] = mosaic
-            while next_idx in pending:
-                writer.write(pending.pop(next_idx))
-                next_idx += 1
+        writer.write(mosaic)
     writer.release()
 
 
@@ -304,7 +349,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stereo-baseline-ratio", type=float, default=0.08, help="Horizontal slit offset ratio (relative to frame width) for stereo pair")
     parser.add_argument("--vertical-scale", type=float, default=1.0, help="Vertical scale factor to compensate x-slit aspect distortion")
     parser.add_argument("--lock-point", type=float, nargs=2, default=None, metavar=("X", "Y"), help="Optional convergence point in pixels")
-    parser.add_argument("--max-features", type=int, default=2000, help="ORB feature budget per frame")
+    parser.add_argument("--max-features", type=int, default=2000, help="feature budget per frame")
     parser.add_argument("--ransac-thresh", type=float, default=2.0, help="RANSAC reprojection threshold (pixels) for affine estimation")
     return parser.parse_args()
 
