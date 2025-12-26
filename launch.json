@@ -1,0 +1,42 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Run pipeline",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/ex4.py",
+      "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "args": [
+        "--input",
+        "${workspaceFolder}/input/Kessaria.mp4",
+
+        "--smooth-radius",
+        "25",
+        "--stereo-baseline-ratio",
+        "0.08",
+        "--max-features",
+        "2000",
+        "--strip-ratio",
+        "0.08",
+        "--vertical-scale",
+        "1.0",
+        "--stride",
+        "1"
+      ],
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Attach (debugpy)",
+      "type": "python",
+      "request": "attach",
+      "connect": {
+        "host": "localhost",
+        "port": 5678
+      },
+      "justMyCode": true
+    }
+  ]
+}

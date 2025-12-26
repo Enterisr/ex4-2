@@ -1,490 +1,23 @@
 from __future__ import annotations
 
 import argparse
-import math
-import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
 
 import cv2
-import numpy as np
 
-try:
-    from tqdm.auto import tqdm
-except Exception:
-    tqdm = None
+from pipeline.io_utils import read_video_frames
+from pipeline.mosaic import build_mosaic, compute_canvas_bounds, render_strip_sweep_video, write_video
+from pipeline.transforms import (
+    cancel_cumulative_rotation,
+    local_to_global_transformations,
+    pairwise_transforms,
+    detrend_video,
+)
+from pipeline.utils import resolve_workers
 
 
-Affine3x3 = np.ndarray
-
-
-def progress_iter(iterable: Iterable, total: Optional[int] = None, desc: str = ""):
-    """Wrap an iterable with tqdm if available to show progress."""
-    if tqdm is None:
-        return iterable
-    return tqdm(iterable, total=total, desc=desc, leave=False)
-
-
-def resolve_workers(value: Optional[int]) -> int:
-    if value is None or value == 0:
-        return max(1, min(8, os.cpu_count() or 1))
-    return max(1, value)
-
-
-def read_video_frames(path: Path, max_frames: Optional[int] = None, stride: int = 1) -> List[np.ndarray]:
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {path}")
-
-    frames: List[np.ndarray] = []
-    index = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if index % stride == 0:
-            frames.append(frame)
-            if max_frames and len(frames) >= max_frames:
-                break
-        index += 1
-    cap.release()
-    if not frames:
-        raise ValueError("No frames read from video")
-    return frames
-
-
-def harris_corners(
-    gray: np.ndarray,
-    max_features: int,
-    quality_level: float,
-    min_distance: int,
-    block_size: int,
-    k: float = 0.04,
-    mask: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Manual Harris detector with mask support."""
-    g = gray.astype(np.float32)
-    Ix = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
-    Iy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
-
-    Ixx = Ix * Ix
-    Iyy = Iy * Iy
-    Ixy = Ix * Iy
-
-    Sxx = cv2.GaussianBlur(Ixx, (block_size, block_size), 0)
-    Syy = cv2.GaussianBlur(Iyy, (block_size, block_size), 0)
-    Sxy = cv2.GaussianBlur(Ixy, (block_size, block_size), 0)
-
-    R = (Sxx * Syy - Sxy * Sxy) - k * (Sxx + Syy) ** 2
-    
-    # Apply mask if provided
-    if mask is not None:
-        R[mask == 0] = 0
-
-    R[R < 0] = 0
-    if R.size == 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    R_max = float(R.max())
-    if not np.isfinite(R_max) or R_max <= 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    thresh = quality_level * R_max
-    mask_r = R >= thresh
-    if not np.any(mask_r):
-        return np.empty((0, 2), dtype=np.float32)
-
-    dilated = cv2.dilate(R, None)
-    peaks = (R == dilated) & mask_r
-    ys, xs = np.nonzero(peaks)
-    scores = R[ys, xs]
-    if len(scores) == 0:
-        return np.empty((0, 2), dtype=np.float32)
-
-    order = np.argsort(scores)[::-1]
-    pts: List[Tuple[int, int]] = []
-    min_dist2 = float(min_distance * min_distance)
-    for idx in order:
-        y = int(ys[idx])
-        x = int(xs[idx])
-        if all((x - px) * (x - px) + (y - py) * (y - py) >= min_dist2 for px, py in pts):
-            pts.append((x, y))
-            if len(pts) >= max_features:
-                break
-
-    if not pts:
-        return np.empty((0, 2), dtype=np.float32)
-    return np.array(pts, dtype=np.float32)
-
-
-def detect_and_match(gray_a: np.ndarray, gray_b: np.ndarray, max_features: int = 2000, keep: int = 400, mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
-    corners = harris_corners(
-        gray_a,
-        max_features=max_features,
-        quality_level=0.01,
-        min_distance=6,
-        block_size=9,
-        mask=mask
-    )
-    if len(corners) < 4:
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
-
-    pts_prev = corners.astype(np.float32)
-    pts_next, status, err = cv2.calcOpticalFlowPyrLK(
-        gray_a,
-        gray_b,
-        pts_prev,
-        None,
-        winSize=(21, 21), # Increased window size for stability
-        maxLevel=3,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-    )
-    if pts_next is None or status is None or err is None:
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
-
-    status = status.ravel().astype(bool)
-    err = err.ravel()
-    good = status & np.isfinite(err)
-    if good.sum() < 4:
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
-
-    pts_prev_good = pts_prev[good]
-    pts_next_good = pts_next[good]
-    err_good = err[good]
-
-    keep_n = min(keep, len(pts_prev_good))
-    order = np.argsort(err_good)[:keep_n]
-    pts_prev_good = pts_prev_good[order]
-    pts_next_good = pts_next_good[order]
-
-    return pts_prev_good, pts_next_good
-
-
-def estimate_affine(src: np.ndarray, dst: np.ndarray, ransac_thresh: float = 3.0) -> Affine3x3:
-    if len(src) < 4 or len(dst) < 4:
-        return np.eye(3, dtype=np.float32)
-    # Using EstimateAffinePartial2D restricts to rotation/translation/scale (no shear), which is better for this task
-    M, _ = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh)
-    if M is None:
-        return np.eye(3, dtype=np.float32)
-    out = np.eye(3, dtype=np.float32)
-    out[:2, :3] = M
-    return out
-
-
-def pairwise_transforms(frames: Sequence[np.ndarray], max_features: int = 2000, ransac_thresh: float = 2.0) -> List[Affine3x3]:
-    gray_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
-    transforms: List[Affine3x3] = [np.eye(3, dtype=np.float32)]
-    
-    # --- MASK CREATION FOR JELLO FIX ---
-    # Create a mask that ignores the center 30% of the image (where the train/vehicle usually is)
-    h, w = gray_frames[0].shape
-    mask = np.ones((h, w), dtype=np.uint8) * 255
-    # Mask out the vertical center band (keep top 25% and bottom 25%)
-    mask[int(h * 0.25) : int(h * 0.75), :] = 0
-    
-    for i in progress_iter(range(1, len(gray_frames)), total=len(gray_frames) - 1, desc="Pairwise align"):
-        pts_prev, pts_curr = detect_and_match(gray_frames[i - 1], gray_frames[i], max_features=max_features, mask=mask)
-        M = estimate_affine(pts_curr, pts_prev, ransac_thresh=ransac_thresh)
-        transforms.append(M)
-    return transforms
-
-
-def decompose_affine(M: Affine3x3) -> Tuple[float, float, float, float]:
-    a, b, tx = M[0, 0], M[0, 1], M[0, 2]
-    c, d, ty = M[1, 0], M[1, 1], M[1, 2]
-    angle = math.atan2(c, a)
-    scale_x = math.hypot(a, c)
-    scale_y = math.hypot(b, d)
-    scale = 0.5 * (scale_x + scale_y)
-    return tx, ty, angle, scale
-
-
-def compose_affine_params(tx: float, ty: float, angle: float, scale: float = 1.0) -> Affine3x3:
-    ca = math.cos(angle) * scale
-    sa = math.sin(angle) * scale
-    M = np.eye(3, dtype=np.float32)
-    M[0, 0] = ca
-    M[0, 1] = -sa
-    M[1, 0] = sa
-    M[1, 1] = ca
-    M[0, 2] = tx
-    M[1, 2] = ty
-    return M
-
-
-def smooth_signal(values: Sequence[float], radius: int) -> np.ndarray:
-    if radius <= 0:
-        return np.asarray(values, dtype=np.float32)
-    kernel_size = radius * 2 + 1
-    kernel = np.ones(kernel_size, dtype=np.float32) / float(kernel_size)
-    # Padding with edge to prevent boundary artifacts
-    padded = np.pad(np.asarray(values, dtype=np.float32), (radius, radius), mode="edge")
-    smoothed = np.convolve(padded, kernel, mode="valid")
-    return smoothed.astype(np.float32)
-
-
-def stabilize_trajectory(
-    globals_full: Sequence[Affine3x3],
-    smooth_radius: int,
-    smooth_x: bool = False,
-    smooth_y: bool = True,
-    smooth_angle: bool = True,
-    smooth_scale: bool = False,
-    detrend_y: bool = True,
-    detrend_angle: bool = True,
-) -> Tuple[List[Affine3x3], List[Affine3x3]]:
-    """
-    Returns TWO lists:
-    1. globals_detrended_noisy: The trajectory with the slope removed, but keeping the frame-to-frame jitter.
-    2. globals_stable: The completely smooth, detrended trajectory.
-    """
-    txs: List[float] = []
-    tys: List[float] = []
-    angles: List[float] = []
-    scales: List[float] = []
-    for M in globals_full:
-        tx, ty, ang, scl = decompose_affine(M)
-        txs.append(tx)
-        tys.append(ty)
-        angles.append(ang)
-        scales.append(scl)
-
-    angles_unwrapped = np.unwrap(np.asarray(angles, dtype=np.float32))
-
-    n = len(angles_unwrapped)
-    txs_arr = np.asarray(txs, dtype=np.float32)
-    tys_arr = np.asarray(tys, dtype=np.float32)
-    angles_arr = angles_unwrapped.astype(np.float32)
-    scales_arr = np.asarray(scales, dtype=np.float32)
-
-    # 1. Detrending (Linear Trend Removal)
-    if detrend_y and n > 1:
-        y_trend = np.linspace(tys_arr[0], tys_arr[-1], n, dtype=np.float32)
-        tys_arr = tys_arr - y_trend + tys_arr[0]
-        
-    if detrend_angle and n > 1:
-        angle_trend = np.linspace(angles_arr[0], angles_arr[-1], n, dtype=np.float32)
-        angles_arr = angles_arr - angle_trend + angles_arr[0]
-
-    # At this point, *_arr variables contain the DETRENDED but NOISY data.
-    
-    # 2. Smoothing
-    sm_txs = smooth_signal(txs_arr, smooth_radius) if smooth_x else txs_arr
-    sm_tys = smooth_signal(tys_arr, smooth_radius) if smooth_y else tys_arr
-    sm_angles = smooth_signal(angles_arr, smooth_radius) if smooth_angle else angles_arr
-    sm_scales = smooth_signal(scales_arr, smooth_radius) if smooth_scale else scales_arr
-
-    globals_detrended_noisy: List[Affine3x3] = []
-    globals_stable: List[Affine3x3] = []
-
-    # Reconstruct both lists
-    for i in range(n):
-        # Noisy (but detrended)
-        globals_detrended_noisy.append(compose_affine_params(
-            float(txs_arr[i]), float(tys_arr[i]), float(angles_arr[i]), float(scales_arr[i])
-        ))
-        # Smooth
-        globals_stable.append(compose_affine_params(
-            float(sm_txs[i]), float(sm_tys[i]), float(sm_angles[i]), float(sm_scales[i])
-        ))
-
-    return globals_detrended_noisy, globals_stable
-
-
-def compose_global(pairwise: Sequence[Affine3x3]) -> List[Affine3x3]:
-    globals_: List[Affine3x3] = [np.eye(3, dtype=np.float32)]
-    for i in range(1, len(pairwise)):
-        globals_.append(globals_[-1] @ pairwise[i])
-    return globals_
-
-
-def lock_convergence_point(transforms: Sequence[Affine3x3], point: Optional[Tuple[float, float]]) -> List[Affine3x3]:
-    if point is None:
-        return list(transforms)
-    px, py = point
-    p = np.array([px, py], dtype=np.float32)
-    locked: List[Affine3x3] = []
-    for T in transforms:
-        R = T[:2, :2]
-        t = T[:2, 2]
-        adjust = (R - np.eye(2, dtype=np.float32)) @ p
-        new_t = t - adjust
-        new_T = T.copy()
-        new_T[:2, 2] = new_t
-        locked.append(new_T)
-    return locked
-
-
-def compute_canvas_bounds(frames: Sequence[np.ndarray], transforms: Sequence[Affine3x3]) -> Tuple[Tuple[int, int], np.ndarray]:
-    h, w = frames[0].shape[:2]
-    corners = np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1]], dtype=np.float32).T
-    xs: List[float] = []
-    ys: List[float] = []
-    for T in transforms:
-        warped = T @ corners
-        xs.extend(warped[0])
-        ys.extend(warped[1])
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    width = int(math.ceil(max_x - min_x))
-    height = int(math.ceil(max_y - min_y))
-    offset = np.array([-min_x, -min_y], dtype=np.float32)
-    return (height, width), offset
-
-
-def warp_frame(frame: np.ndarray, transform: Affine3x3, canvas_size: Tuple[int, int], offset: np.ndarray, border_value: Tuple[int, int, int] = (0, 0, 0)) -> np.ndarray:
-    warp = transform[:2, :].copy()
-    warp[:, 2] += offset
-    return cv2.warpAffine(frame, warp, (canvas_size[1], canvas_size[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=border_value)
-
-
-def build_mosaic(
-    frames: Sequence[np.ndarray],
-    transforms_smooth: Sequence[Affine3x3],
-    transforms_noisy: Sequence[Affine3x3], # New Parameter: Used for image content
-    strip_ratio: float,
-    canvas_size: Tuple[int, int],
-    offset: np.ndarray,
-    strip_center_ratio: float = 0.0,
-    vertical_scale: float = 1.0,
-    num_workers: int = 1,
-) -> np.ndarray:
-    h, w = frames[0].shape[:2]
-    strip_w = max(4, int(w * strip_ratio))
-    center_x = w * (0.5 + strip_center_ratio)
-    x0 = int(center_x - strip_w * 0.5)
-    x0 = max(0, min(w - strip_w, x0))
-    mask = np.zeros((h, w), dtype=np.uint8)
-    mask[:, x0 : x0 + strip_w] = 255
-
-    acc = np.zeros((canvas_size[0], canvas_size[1], 3), dtype=np.float32)
-    weight = np.zeros((canvas_size[0], canvas_size[1], 1), dtype=np.float32)
-
-    desc = "Blending strips"
-
-    def warp_task(frame: np.ndarray, T_smooth: Affine3x3, T_noisy: Affine3x3) -> Tuple[np.ndarray, np.ndarray]:
-        # KEY FIX: Decoupled Warping
-        # 1. Warp the IMAGE using the NOISY transform (places pixels correctly in the world, fixing sawtooth)
-        warped_frame = warp_frame(frame, T_noisy, canvas_size, offset, border_value=(0, 0, 0)).astype(np.float32)
-        
-        # 2. Warp the MASK using the SMOOTH transform (cuts a clean straight strip, fixing jello geometry)
-        warped_mask = warp_frame(mask, T_smooth, canvas_size, offset, border_value=0)
-        
-        m = (warped_mask > 0).astype(np.float32)[..., None]
-        return warped_frame * m, m
-
-    # Zip all three lists
-    for frame, T_sm, T_nz in progress_iter(zip(frames, transforms_smooth, transforms_noisy), total=len(frames), desc=desc):
-        contrib, w = warp_task(frame, T_sm, T_nz)
-        acc += contrib
-        weight += w
-
-    weight[weight == 0] = 1.0
-    mosaic = (acc / weight).astype(np.uint8)
-
-    if not math.isclose(vertical_scale, 1.0):
-        new_h = max(1, int(round(mosaic.shape[0] * vertical_scale)))
-        mosaic = cv2.resize(mosaic, (mosaic.shape[1], new_h), interpolation=cv2.INTER_CUBIC)
-
-    return mosaic
-
-
-def cancel_cumulative_rotation(transforms: Sequence[Affine3x3]) -> List[Affine3x3]:
-    """
-    Corrects the 'Banana Effect' by removing the average rotational drift 
-    from the pairwise transformations.
-    """
-    if not transforms:
-        return []
-
-    pairwise_angles = []
-    for T in transforms:
-        _, _, ang, _ = decompose_affine(T) 
-        pairwise_angles.append(ang)
-
-    total_rotation = np.sum(pairwise_angles)
-    avg_drift = total_rotation / len(transforms)
-
-    corrected_transforms = []
-    for i, T in enumerate(transforms):
-        tx, ty, ang, scl = decompose_affine(T)
-        
-        # Remove the average drift from this specific step
-        new_ang = ang - avg_drift
-
-        new_T = compose_affine_params(tx, ty, new_ang, scl)
-        corrected_transforms.append(new_T)
-
-    return corrected_transforms
-def render_strip_sweep_video(
-    frames: Sequence[np.ndarray],
-    transforms_smooth: Sequence[Affine3x3],
-    transforms_noisy: Sequence[Affine3x3],
-    canvas_size: Tuple[int, int],
-    offset: np.ndarray,
-    strip_ratio: float,
-    vertical_scale: float,
-    output_path: Path,
-    num_workers: int,
-    sweep_extent: float = 0.4,
-    steps: int = 60,
-    fps: float = 25.0,
-) -> None:
-    centers = np.linspace(-abs(sweep_extent), abs(sweep_extent), steps)
-    
-    first = build_mosaic(
-        frames,
-        transforms_smooth,
-        transforms_noisy,
-        strip_ratio=strip_ratio,
-        canvas_size=canvas_size,
-        offset=offset,
-        strip_center_ratio=centers[0],
-        vertical_scale=vertical_scale,
-        num_workers=num_workers,
-    )
-    h, w = first.shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
-    
-    if not writer.isOpened():
-        print(f"Warning: failed to open sweep VideoWriter for {output_path}")
-        return
-
-    writer.write(first)
-
-    with ThreadPoolExecutor(max_workers=max(1, num_workers)) as executor:
-        futures = []
-        for center_ratio in centers[1:]:
-            futures.append(executor.submit(
-                build_mosaic,
-                frames,
-                transforms_smooth,
-                transforms_noisy,
-                strip_ratio,
-                canvas_size,
-                offset,
-                center_ratio,
-                vertical_scale,
-                1
-            ))
-
-        for fut in progress_iter(futures, total=len(futures), desc="Rendering Sweep Video"):
-            mosaic = fut.result()
-            writer.write(mosaic)
-            
-    writer.release()
-
-def write_video(frames: Sequence[np.ndarray], transforms: Sequence[Affine3x3], canvas_size: Tuple[int, int], offset: np.ndarray, path: Path, fps: float) -> None:
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(path), fourcc, fps, (canvas_size[1], canvas_size[0]))
-    for frame, T in progress_iter(zip(frames, transforms), total=len(frames), desc="Rendering video"):
-        warped = warp_frame(frame, T, canvas_size, offset)
-        writer.write(warped)
-    writer.release()
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stereo mosaicing pipeline")
     parser.add_argument("--input", required=True, type=Path, help="Input video path")
@@ -497,11 +30,98 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-features", type=int, default=1000, help="feature budget per frame")
     parser.add_argument("--blend-workers", type=int, default=0, help="Worker threads for strip blending")
     parser.add_argument("--smooth-radius", type=int, default=25, help="Radius for trajectory smoothing")    
-    parser.add_argument("--stereo-prefix", type=Path, default=None, help="If set, saves left/right mosaics using this prefix (adds _L.png/_R.png)")
     parser.add_argument("--stereo-baseline-ratio", type=float, default=0.08, help="Horizontal slit offset ratio (relative to frame width) for stereo pair")
     parser.add_argument("--lock-point", type=float, nargs=2, default=None, metavar=("X", "Y"), help="Optional convergence point in pixels")
     
     return parser.parse_args()
+
+
+def generate_outputs(
+    frames,
+    global_stable,
+    global_noisy,
+    canvas_size,
+    offset,
+    args,
+    fps,
+    run_dir,
+    mosaic_workers,
+):
+    stereo_baseline = args.stereo_baseline_ratio
+
+    with ThreadPoolExecutor(max_workers=mosaic_workers) as executor:
+        mosaic_future = executor.submit(
+            build_mosaic,
+            frames,
+            global_stable,
+            global_noisy,
+            args.strip_ratio,
+            canvas_size,
+            offset,
+            0.0,
+            args.vertical_scale,
+            
+        )
+
+        print(f"Generating stereo pair with baseline {stereo_baseline}...")
+        left_future = executor.submit(
+            build_mosaic,
+            frames,
+            global_stable,
+            global_noisy,
+            args.strip_ratio,
+            canvas_size,
+            offset,
+            -stereo_baseline,
+            args.vertical_scale,
+            
+        )
+        right_future = executor.submit(
+            build_mosaic,
+            frames,
+            global_stable,
+            global_noisy,
+            args.strip_ratio,
+            canvas_size,
+            offset,
+            stereo_baseline,
+            args.vertical_scale,
+            
+        )
+
+        mosaic = mosaic_future.result()
+        left = left_future.result()
+        right = right_future.result()
+
+    mosaic_path = run_dir / f"{args.input.stem}_mosaic.png"
+    cv2.imwrite(str(mosaic_path), mosaic)
+    print(f"Mosaic saved to: {mosaic_path}")
+
+    left_path = run_dir / f"{args.input.stem}_mosaic_L.png"
+    right_path = run_dir / f"{args.input.stem}_mosaic_R.png"
+
+    cv2.imwrite(str(left_path), left)
+    cv2.imwrite(str(right_path), right)
+    print(f"Stereo images saved to: {left_path}, {right_path}")
+
+    sweep_path = run_dir / f"{args.input.stem}_sweep.mp4"
+    render_strip_sweep_video(
+        frames,
+        global_stable,
+        global_noisy,
+        canvas_size,
+        offset,
+        strip_ratio=args.strip_ratio,
+        vertical_scale=args.vertical_scale,
+        output_path=sweep_path,
+        num_workers=mosaic_workers,
+        sweep_extent=max(0.05, stereo_baseline * 2.5),
+        steps=60,
+        fps=max(10.0, fps),
+    )
+    print(f"Sweep video saved to: {sweep_path}")
+
+    return mosaic, left, right, mosaic_path, left_path, right_path, sweep_path
 
 def main() -> None:
     args = parse_args()
@@ -516,8 +136,8 @@ def main() -> None:
     pairwise = pairwise_transforms(frames, max_features=args.max_features, ransac_thresh=3.0)
     pairwise = cancel_cumulative_rotation(pairwise)
 
-    global_full = compose_global(pairwise)
-    global_noisy, global_stable = stabilize_trajectory(
+    global_full = local_to_global_transformations(pairwise)
+    global_noisy, global_stable = detrend_video(
         global_full,
         smooth_radius=args.smooth_radius,
         smooth_x=False,
@@ -530,92 +150,22 @@ def main() -> None:
 
     canvas_size, offset = compute_canvas_bounds(frames, global_stable)
 
-    left = right = None
-    mosaic = None
-    stereo_baseline = args.stereo_baseline_ratio if args.stereo_prefix is not None else None
-
-    with ThreadPoolExecutor(max_workers=mosaic_workers) as executor:
-        mosaic_future = executor.submit(
-            build_mosaic,
-            frames,
-            global_stable,
-            global_noisy,
-            args.strip_ratio,
-            canvas_size,
-            offset,
-            0.0,
-            args.vertical_scale,
-            1,
-        )
-
-        left_future = right_future = None
-        
-        # משימה 2+3: סטריאו (אם נדרש)
-        if stereo_baseline is not None:
-            print(f"Generating stereo pair with baseline {stereo_baseline}...")
-            left_future = executor.submit(
-                build_mosaic,
-                frames,
-                global_stable,
-                global_noisy,
-                args.strip_ratio,
-                canvas_size,
-                offset,
-                -stereo_baseline, # עין שמאל
-                args.vertical_scale,
-                1,
-            )
-            right_future = executor.submit(
-                build_mosaic,
-                frames,
-                global_stable,
-                global_noisy,
-                args.strip_ratio,
-                canvas_size,
-                offset,
-                stereo_baseline, 
-                args.vertical_scale,
-                1,
-            )
-
-        mosaic = mosaic_future.result()
-        if left_future and right_future:
-            left = left_future.result()
-            right = right_future.result()
-
-    mosaic_path = run_dir / f"{args.input.stem}_mosaic.png"
-    cv2.imwrite(str(mosaic_path), mosaic)
-    print(f"Mosaic saved to: {mosaic_path}")
-
-    if args.stereo_prefix is not None and left is not None and right is not None:
-        args.stereo_prefix.parent.mkdir(parents=True, exist_ok=True)
-        
-        left_path = Path(str(args.stereo_prefix) + "_L.png")
-        right_path = Path(str(args.stereo_prefix) + "_R.png")
-        
-        cv2.imwrite(str(left_path), left)
-        cv2.imwrite(str(right_path), right)
-        print(f"Stereo images saved to: {left_path}, {right_path}")
-
-        sweep_path = Path(str(args.stereo_prefix) + "_sweep.mp4")
-        render_strip_sweep_video(
-            frames,
-            global_stable,
-            global_noisy,
-            canvas_size,
-            offset,
-            strip_ratio=args.strip_ratio,
-            vertical_scale=args.vertical_scale,
-            output_path=sweep_path,
-            num_workers=mosaic_workers,
-            sweep_extent=max(0.05, stereo_baseline * 2.5),
-            steps=60,
-            fps=max(10.0, fps),
-        )
-        print(f"Sweep video saved to: {sweep_path}")
+    generate_outputs(
+        frames,
+        global_stable,
+        global_noisy,
+        canvas_size,
+        offset,
+        args,
+        fps,
+        run_dir,
+        mosaic_workers,
+    )
 
     if args.stabilized_video:
         stabilized_path = Path(args.stabilized_video)
         write_video(frames, global_noisy, canvas_size, offset, stabilized_path, fps=fps)
+
+
 if __name__ == "__main__":
     main()
