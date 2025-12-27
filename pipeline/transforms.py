@@ -167,6 +167,7 @@ def pairwise_transforms(
     transforms: List[Affine3x3] = [np.eye(3, dtype=np.float32)]
 
     h, w = gray_frames[0].shape
+    #mask to ignore most of the image so we wont get feature points around the subject but the background
     if mask is None:
         mask = np.ones((h, w), dtype=np.uint8) * 255
         mask[int(h * 0.25) : int(h * 0.75), :] = 0

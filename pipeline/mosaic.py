@@ -18,6 +18,7 @@ def compute_canvas_bounds(frames: Sequence[np.ndarray], transforms: Sequence[Aff
     xs = []
     ys = []
     for T in transforms:
+        #find image bounds  per transformation
         warped = T @ corners
         xs.extend(warped[0])
         ys.extend(warped[1])
@@ -63,7 +64,7 @@ def build_mosaic(
     count_of_strips_per_px = np.zeros((canvas_size[0], canvas_size[1], 1), dtype=np.float32)
 
     def warp_task(frame: np.ndarray, T_smooth: Affine3x3, T_with_sttuer: Affine3x3):
-        warped_frame = warp_frame(frame, T_with_sttuer, canvas_size, offset, border_value=(0, 0, 0)).astype(np.float32)
+        warped_frame = warp_frame(frame, T_smooth, canvas_size, offset, border_value=(0, 0, 0)).astype(np.float32)
         #warp the mask to keep it in the transformed location after stablisliztion
         warped_mask = warp_frame(mask, T_smooth, canvas_size, offset, border_value=0)
         m = (warped_mask > 0).astype(np.float32)[..., None]
@@ -99,8 +100,12 @@ def render_strip_sweep_video(
     sweep_extent: float = 0.4,
     steps: int = 60,
     fps: float = 25.0,
-) -> None:
-    centers = np.linspace(-abs(sweep_extent), abs(sweep_extent), steps)
+    downsample_targets: Sequence[Tuple[int, int]] | None = None,
+) -> list[tuple[Path, tuple[int, int]]]:
+    strip_locations = np.linspace(-abs(sweep_extent), abs(sweep_extent), steps)
+    # Build a bounce sequence so the sweep plays forward and then backward without
+    # duplicating the endpoints, e.g., [a, b, c, b].
+    strip_locations = np.concatenate([strip_locations, strip_locations[-2:0:-1]])
 
     first = build_mosaic(
         frames,
@@ -109,7 +114,7 @@ def render_strip_sweep_video(
         strip_ratio=strip_ratio,
         canvas_size=canvas_size,
         offset=offset,
-        strip_x_offset=centers[0],
+        strip_x_offset=strip_locations[0],
         vertical_scale=vertical_scale,
     )
     h, w = first.shape[:2]
@@ -118,13 +123,51 @@ def render_strip_sweep_video(
 
     if not writer.isOpened():
         print(f"Warning: failed to open sweep VideoWriter for {output_path}")
-        return
+        return []
+
+    downsample_targets = downsample_targets or []
+    downsample_writers = []
+    downsample_outputs: list[tuple[Path, tuple[int, int]]] = []
+
+    for target_w, target_h in downsample_targets:
+        if target_w <= 0 or target_h <= 0:
+            continue
+
+        scale = min(target_w / w, target_h / h, 1.0)
+        if scale >= 1.0:
+            # Skip if the source is already smaller than the target box.
+            continue
+
+        new_w = max(2, int(round(w * scale)))
+        new_h = max(2, int(round(h * scale)))
+        new_w = min(target_w, new_w)
+        new_h = min(target_h, new_h)
+
+        if new_w % 2 != 0:
+            new_w -= 1
+        if new_h % 2 != 0:
+            new_h -= 1
+
+        if new_w < 2 or new_h < 2:
+            continue
+
+        target_path = output_path.with_name(f"{output_path.stem}_{target_h}p{output_path.suffix}")
+        ds_writer = cv2.VideoWriter(str(target_path), fourcc, fps, (new_w, new_h))
+        if not ds_writer.isOpened():
+            print(f"Warning: failed to open downsampled sweep VideoWriter for {target_path}")
+            continue
+
+        downsample_writers.append((ds_writer, (new_w, new_h), target_path))
+        downsample_outputs.append((target_path, (new_w, new_h)))
 
     writer.write(first)
+    for ds_writer, size, _ in downsample_writers:
+        downsampled = cv2.resize(first, size, interpolation=cv2.INTER_AREA)
+        ds_writer.write(downsampled)
 
     with ThreadPoolExecutor(max_workers=max(1, num_workers)) as executor:
         futures = []
-        for center_ratio in centers[1:]:
+        for center_ratio in strip_locations[1:]:
             futures.append(
                 executor.submit(
                     build_mosaic,
@@ -143,8 +186,15 @@ def render_strip_sweep_video(
         for fut in progress_iter(futures, total=len(futures), desc="Rendering Sweep Video"):
             mosaic = fut.result()
             writer.write(mosaic)
+            for ds_writer, size, _ in downsample_writers:
+                downsampled = cv2.resize(mosaic, size, interpolation=cv2.INTER_AREA)
+                ds_writer.write(downsampled)
 
     writer.release()
+    for ds_writer, _, _ in downsample_writers:
+        ds_writer.release()
+
+    return downsample_outputs
 
 
 def write_video(

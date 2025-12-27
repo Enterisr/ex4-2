@@ -11,9 +11,10 @@ from pipeline.io_utils import read_video_frames
 from pipeline.mosaic import build_mosaic, compute_canvas_bounds, render_strip_sweep_video, write_video
 from pipeline.transforms import (
     cancel_cumulative_rotation,
-    local_to_global_transformations,
-    pairwise_transforms,
     detrend_video,
+    local_to_global_transformations,
+    lock_convergence_point,
+    pairwise_transforms,
 )
 from pipeline.utils import resolve_workers
 
@@ -105,7 +106,7 @@ def generate_outputs(
     print(f"Stereo images saved to: {left_path}, {right_path}")
 
     sweep_path = run_dir / f"{args.input.stem}_sweep.mp4"
-    render_strip_sweep_video(
+    downsampled_sweeps = render_strip_sweep_video(
         frames,
         global_stable,
         global_noisy,
@@ -118,8 +119,11 @@ def generate_outputs(
         sweep_extent=max(0.05, stereo_baseline * 2.5),
         steps=60,
         fps=max(10.0, fps),
+        downsample_targets=[(1280, 720), (1920, 1080)],
     )
     print(f"Sweep video saved to: {sweep_path}")
+    for ds_path, (ds_w, ds_h) in downsampled_sweeps:
+        print(f"Downsampled sweep saved to: {ds_path} ({ds_w}x{ds_h})")
 
     return mosaic, left, right, mosaic_path, left_path, right_path, sweep_path
 
@@ -128,12 +132,19 @@ def main() -> None:
     frames = read_video_frames(args.input, max_frames=args.max_frames, stride=args.stride)
     fps = cv2.VideoCapture(str(args.input)).get(cv2.CAP_PROP_FPS) or 25.0
 
+    lock_point = args.lock_point
+    if lock_point is None:
+        # Default to the image center when no explicit convergence point is provided.
+        h, w = frames[0].shape[:2]
+        lock_point = (w * 0.5, h * 0.5)
+
     mosaic_workers = resolve_workers(args.blend_workers)
 
     run_dir = Path("output") / f"{args.input.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     pairwise = pairwise_transforms(frames, max_features=args.max_features, ransac_thresh=3.0)
+    
     pairwise = cancel_cumulative_rotation(pairwise)
 
     global_full = local_to_global_transformations(pairwise)
@@ -147,6 +158,7 @@ def main() -> None:
         detrend_y=True,
         detrend_angle=True,
     )
+    global_full = lock_convergence_point(global_full, lock_point)
 
     canvas_size, offset = compute_canvas_bounds(frames, global_stable)
 
