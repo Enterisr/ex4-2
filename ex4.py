@@ -32,7 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blend-workers", type=int, default=0, help="Worker threads for strip blending")
     parser.add_argument("--smooth-radius", type=int, default=25, help="Radius for trajectory smoothing")    
     parser.add_argument("--stereo-baseline-ratio", type=float, default=0.08, help="Horizontal slit offset ratio (relative to frame width) for stereo pair")
-    parser.add_argument("--lock-point", type=float, nargs=2, default=None, metavar=("X", "Y"), help="Optional convergence point in pixels")
+    parser.add_argument(
+        "--process-portrait",
+        action="store_true",
+        help="If the input video is portrait, rotate it 90 degrees CCW for processing and rotate outputs back to portrait",
+    )
     
     return parser.parse_args()
 
@@ -47,6 +51,7 @@ def generate_outputs(
     fps,
     run_dir,
     mosaic_workers,
+    rotate_back_code=None,
 ):
     stereo_baseline = args.stereo_baseline_ratio
 
@@ -94,6 +99,15 @@ def generate_outputs(
         left = left_future.result()
         right = right_future.result()
 
+    def restore_orientation(img):
+        if rotate_back_code is None:
+            return img
+        return cv2.rotate(img, rotate_back_code)
+
+    mosaic = restore_orientation(mosaic)
+    left = restore_orientation(left)
+    right = restore_orientation(right)
+
     mosaic_path = run_dir / f"{args.input.stem}_mosaic.png"
     cv2.imwrite(str(mosaic_path), mosaic)
     print(f"Mosaic saved to: {mosaic_path}")
@@ -120,6 +134,7 @@ def generate_outputs(
         steps=60,
         fps=max(10.0, fps),
         downsample_targets=[(1280, 720), (1920, 1080)],
+        frame_postprocess=restore_orientation,
     )
     print(f"Sweep video saved to: {sweep_path}")
     for ds_path, (ds_w, ds_h) in downsampled_sweeps:
@@ -132,11 +147,12 @@ def main() -> None:
     frames = read_video_frames(args.input, max_frames=args.max_frames, stride=args.stride)
     fps = cv2.VideoCapture(str(args.input)).get(cv2.CAP_PROP_FPS) or 25.0
 
-    lock_point = args.lock_point
-    if lock_point is None:
-        # Default to the image center when no explicit convergence point is provided.
-        h, w = frames[0].shape[:2]
-        lock_point = (w * 0.5, h * 0.5)
+    rotate_back_code = None
+    if args.process_portrait:
+        print("Process-portrait requested; rotating 90 degrees CCW for processing.")
+        frames = [cv2.rotate(f, cv2.ROTATE_90_COUNTERCLOCKWISE) for f in frames]
+        rotate_back_code = cv2.ROTATE_90_CLOCKWISE
+
 
     mosaic_workers = resolve_workers(args.blend_workers)
 
@@ -158,7 +174,6 @@ def main() -> None:
         detrend_y=True,
         detrend_angle=True,
     )
-    global_full = lock_convergence_point(global_full, lock_point)
 
     canvas_size, offset = compute_canvas_bounds(frames, global_stable)
 
@@ -172,11 +187,21 @@ def main() -> None:
         fps,
         run_dir,
         mosaic_workers,
+        rotate_back_code,
     )
 
     if args.stabilized_video:
         stabilized_path = Path(args.stabilized_video)
-        write_video(frames, global_noisy, canvas_size, offset, stabilized_path, fps=fps)
+        frame_postprocess = (lambda img: cv2.rotate(img, rotate_back_code)) if rotate_back_code is not None else None
+        write_video(
+            frames,
+            global_noisy,
+            canvas_size,
+            offset,
+            stabilized_path,
+            fps=fps,
+            frame_postprocess=frame_postprocess,
+        )
 
 
 if __name__ == "__main__":

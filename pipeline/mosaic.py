@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Sequence, Tuple
+from typing import Callable, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -64,7 +64,7 @@ def build_mosaic(
     count_of_strips_per_px = np.zeros((canvas_size[0], canvas_size[1], 1), dtype=np.float32)
 
     def warp_task(frame: np.ndarray, T_smooth: Affine3x3, T_with_sttuer: Affine3x3):
-        warped_frame = warp_frame(frame, T_smooth, canvas_size, offset, border_value=(0, 0, 0)).astype(np.float32)
+        warped_frame = warp_frame(frame, T_with_sttuer, canvas_size, offset, border_value=(0, 0, 0)).astype(np.float32)
         #warp the mask to keep it in the transformed location after stablisliztion
         warped_mask = warp_frame(mask, T_smooth, canvas_size, offset, border_value=0)
         m = (warped_mask > 0).astype(np.float32)[..., None]
@@ -101,7 +101,11 @@ def render_strip_sweep_video(
     steps: int = 60,
     fps: float = 25.0,
     downsample_targets: Sequence[Tuple[int, int]] | None = None,
+    frame_postprocess: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> list[tuple[Path, tuple[int, int]]]:
+    def apply_post(img: np.ndarray) -> np.ndarray:
+        return frame_postprocess(img) if frame_postprocess else img
+
     strip_locations = np.linspace(-abs(sweep_extent), abs(sweep_extent), steps)
     # Build a bounce sequence so the sweep plays forward and then backward without
     # duplicating the endpoints, e.g., [a, b, c, b].
@@ -117,19 +121,43 @@ def render_strip_sweep_video(
         strip_x_offset=strip_locations[0],
         vertical_scale=vertical_scale,
     )
+    first = apply_post(first)
     h, w = first.shape[:2]
+    mosaics: list[np.ndarray] = [first]
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
 
+    with ThreadPoolExecutor(max_workers=max(1, num_workers)) as executor:
+        futures = []
+        for center_ratio in strip_locations[1:]:
+            futures.append(
+                executor.submit(
+                    build_mosaic,
+                    frames,
+                    transforms_smooth,
+                    transforms_noisy,
+                    strip_ratio,
+                    canvas_size,
+                    offset,
+                    center_ratio,
+                    vertical_scale,
+                )
+            )
+
+        for fut in progress_iter(futures, total=len(futures), desc="Rendering Sweep Video"):
+            mosaic = fut.result()
+            mosaics.append(apply_post(mosaic))
+
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
     if not writer.isOpened():
         print(f"Warning: failed to open sweep VideoWriter for {output_path}")
         return []
 
-    downsample_targets = downsample_targets or []
-    downsample_writers = []
-    downsample_outputs: list[tuple[Path, tuple[int, int]]] = []
+    for mosaic in mosaics:
+        writer.write(mosaic)
+    writer.release()
 
-    for target_w, target_h in downsample_targets:
+    downsample_outputs: list[tuple[Path, tuple[int, int]]] = []
+    for target_w, target_h in downsample_targets or []:
         if target_w <= 0 or target_h <= 0:
             continue
 
@@ -157,42 +185,11 @@ def render_strip_sweep_video(
             print(f"Warning: failed to open downsampled sweep VideoWriter for {target_path}")
             continue
 
-        downsample_writers.append((ds_writer, (new_w, new_h), target_path))
-        downsample_outputs.append((target_path, (new_w, new_h)))
-
-    writer.write(first)
-    for ds_writer, size, _ in downsample_writers:
-        downsampled = cv2.resize(first, size, interpolation=cv2.INTER_AREA)
-        ds_writer.write(downsampled)
-
-    with ThreadPoolExecutor(max_workers=max(1, num_workers)) as executor:
-        futures = []
-        for center_ratio in strip_locations[1:]:
-            futures.append(
-                executor.submit(
-                    build_mosaic,
-                    frames,
-                    transforms_smooth,
-                    transforms_noisy,
-                    strip_ratio,
-                    canvas_size,
-                    offset,
-                    center_ratio,
-                    vertical_scale,
-                    
-                )
-            )
-
-        for fut in progress_iter(futures, total=len(futures), desc="Rendering Sweep Video"):
-            mosaic = fut.result()
-            writer.write(mosaic)
-            for ds_writer, size, _ in downsample_writers:
-                downsampled = cv2.resize(mosaic, size, interpolation=cv2.INTER_AREA)
-                ds_writer.write(downsampled)
-
-    writer.release()
-    for ds_writer, _, _ in downsample_writers:
+        for mosaic in mosaics:
+            downsampled = cv2.resize(mosaic, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            ds_writer.write(downsampled)
         ds_writer.release()
+        downsample_outputs.append((target_path, (new_w, new_h)))
 
     return downsample_outputs
 
@@ -204,10 +201,18 @@ def write_video(
     offset: np.ndarray,
     path: Path,
     fps: float,
+    frame_postprocess: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> None:
+    def apply_post(img: np.ndarray) -> np.ndarray:
+        return frame_postprocess(img) if frame_postprocess else img
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(path), fourcc, fps, (canvas_size[1], canvas_size[0]))
-    for frame, T in progress_iter(zip(frames, transforms), total=len(frames), desc="Rendering video"):
-        warped = warp_frame(frame, T, canvas_size, offset)
-        writer.write(warped)
+    first_frame = apply_post(warp_frame(frames[0], transforms[0], canvas_size, offset))
+    writer = cv2.VideoWriter(str(path), fourcc, fps, (first_frame.shape[1], first_frame.shape[0]))
+    writer.write(first_frame)
+
+    if len(frames) > 1:
+        for frame, T in progress_iter(zip(frames[1:], transforms[1:]), total=len(frames) - 1, desc="Rendering video"):
+            warped = apply_post(warp_frame(frame, T, canvas_size, offset))
+            writer.write(warped)
     writer.release()
