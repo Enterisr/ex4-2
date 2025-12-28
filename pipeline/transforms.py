@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import  List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -43,6 +44,37 @@ def compose_affine_params(tx: float, ty: float, angle: float, scale: float = 1.0
     M[0, 2] = tx
     M[1, 2] = ty
     return M
+
+
+def _should_save_debug(idx: int, total: int, max_files: int = 40) -> bool:
+    if total <= 1:
+        return True
+    stride = max(1, math.ceil(total / max_files))
+    return idx % stride == 0 or idx == total - 1
+
+
+def _save_feature_debug(
+    gray_prev: np.ndarray,
+    gray_curr: np.ndarray,
+    pts_prev: np.ndarray,
+    pts_curr: np.ndarray,
+    frame_idx: int,
+    out_dir: Path,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    vis_prev = cv2.cvtColor(gray_prev, cv2.COLOR_GRAY2BGR)
+    for x, y in pts_prev:
+        cv2.circle(vis_prev, (int(round(x)), int(round(y))), 2, (0, 255, 0), -1)
+    cv2.imwrite(str(out_dir / f"features_{frame_idx:04d}.png"), vis_prev)
+
+    vis_flow = cv2.cvtColor(gray_curr, cv2.COLOR_GRAY2BGR)
+    for (x0, y0), (x1, y1) in zip(pts_prev, pts_curr):
+        p0 = (int(round(x0)), int(round(y0)))
+        p1 = (int(round(x1)), int(round(y1)))
+        cv2.arrowedLine(vis_flow, p0, p1, (0, 200, 255), 1, tipLength=0.25)
+        cv2.circle(vis_flow, p1, 2, (40, 220, 40), -1)
+    cv2.imwrite(str(out_dir / f"flow_{frame_idx:04d}.png"), vis_flow)
 
 
 def smooth_signal(values: Sequence[float], radius: int) -> np.ndarray:
@@ -162,6 +194,7 @@ def pairwise_transforms(
     max_features: int = 2000,
     ransac_thresh: float = 2.0,
     mask: Optional[np.ndarray] = None,
+    debug_dir: Optional[Path] = None,
 ) -> List[Affine3x3]:
     gray_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
     transforms: List[Affine3x3] = [np.eye(3, dtype=np.float32)]
@@ -172,8 +205,12 @@ def pairwise_transforms(
         mask = np.ones((h, w), dtype=np.uint8) * 255
         mask[int(h * 0.25) : int(h * 0.75), :] = 0
 
-    for i in progress_iter(range(1, len(gray_frames)), total=len(gray_frames) - 1, desc="Pairwise align"):
+    total_pairs = len(gray_frames) - 1
+    for i in progress_iter(range(1, len(gray_frames)), total=total_pairs, desc="Pairwise align"):
         pts_prev, pts_curr = detect_and_match(gray_frames[i - 1], gray_frames[i], max_features=max_features, mask=mask)
         M = estimate_affine(pts_curr, pts_prev, ransac_thresh=ransac_thresh)
         transforms.append(M)
+
+        if debug_dir is not None and len(pts_prev) > 0 and _should_save_debug(i, total_pairs):
+            _save_feature_debug(gray_frames[i - 1], gray_frames[i], pts_prev, pts_curr, i, debug_dir)
     return transforms

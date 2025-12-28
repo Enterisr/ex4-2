@@ -8,7 +8,14 @@ from pathlib import Path
 import cv2
 
 from pipeline.io_utils import read_video_frames
-from pipeline.mosaic import build_mosaic, compute_canvas_bounds, render_strip_sweep_video, write_video
+from pipeline.mosaic import (
+    build_mosaic,
+    compute_canvas_bounds,
+    compute_union_coverage_mask,
+    crop_with_mask,
+    render_strip_sweep_video,
+    write_video,
+)
 from pipeline.transforms import (
     cancel_cumulative_rotation,
     detrend_video,
@@ -52,8 +59,19 @@ def generate_outputs(
     run_dir,
     mosaic_workers,
     rotate_back_code=None,
+    debug_dir=None,
 ):
     stereo_baseline = args.stereo_baseline_ratio
+
+    coverage_mask = compute_union_coverage_mask(
+        frames,
+        global_stable,
+        canvas_size,
+        offset,
+        strip_ratio=args.strip_ratio,
+        strip_offsets=[0.0, -stereo_baseline, stereo_baseline],
+        vertical_scale=args.vertical_scale,
+    )
 
     with ThreadPoolExecutor(max_workers=mosaic_workers) as executor:
         mosaic_future = executor.submit(
@@ -66,6 +84,8 @@ def generate_outputs(
             offset,
             0.0,
             args.vertical_scale,
+            debug_dir,
+            "main",
             
         )
 
@@ -80,6 +100,8 @@ def generate_outputs(
             offset,
             -stereo_baseline,
             args.vertical_scale,
+            debug_dir,
+            "stereo_left",
             
         )
         right_future = executor.submit(
@@ -92,12 +114,18 @@ def generate_outputs(
             offset,
             stereo_baseline,
             args.vertical_scale,
+            debug_dir,
+            "stereo_right",
             
         )
 
         mosaic = mosaic_future.result()
         left = left_future.result()
         right = right_future.result()
+
+    mosaic = crop_with_mask(mosaic, coverage_mask)
+    left = crop_with_mask(left, coverage_mask)
+    right = crop_with_mask(right, coverage_mask)
 
     def restore_orientation(img):
         if rotate_back_code is None:
@@ -135,6 +163,7 @@ def generate_outputs(
         fps=max(10.0, fps),
         downsample_targets=[(1280, 720), (1920, 1080)],
         frame_postprocess=restore_orientation,
+        debug_dir=debug_dir,
     )
     print(f"Sweep video saved to: {sweep_path}")
     for ds_path, (ds_w, ds_h) in downsampled_sweeps:
@@ -159,7 +188,19 @@ def main() -> None:
     run_dir = Path("output") / f"{args.input.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    pairwise = pairwise_transforms(frames, max_features=args.max_features, ransac_thresh=3.0)
+    debug_dir = run_dir
+
+    args_out = run_dir / "args.txt"
+    with args_out.open("w", encoding="utf-8") as f:
+        for k, v in sorted(vars(args).items()):
+            f.write(f"{k}: {v}\n")
+
+    pairwise = pairwise_transforms(
+        frames,
+        max_features=args.max_features,
+        ransac_thresh=3.0,
+        debug_dir=debug_dir / "features",
+    )
     
     pairwise = cancel_cumulative_rotation(pairwise)
 
@@ -188,6 +229,7 @@ def main() -> None:
         run_dir,
         mosaic_workers,
         rotate_back_code,
+        debug_dir,
     )
 
     if args.stabilized_video:
