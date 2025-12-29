@@ -12,7 +12,7 @@ from .types import Affine3x3
 from .utils import progress_iter
 
 
-def estimate_affine(src: np.ndarray, dst: np.ndarray, ransac_thresh: float = 3.0) -> Affine3x3:
+def estimate_partial_affine(src: np.ndarray, dst: np.ndarray, ransac_thresh: float = 3.0) -> Affine3x3:
     if len(src) < 4 or len(dst) < 4:
         return np.eye(3, dtype=np.float32)
     M, _ = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh)
@@ -193,22 +193,17 @@ def pairwise_transforms(
     frames: Sequence[np.ndarray],
     max_features: int = 2000,
     ransac_thresh: float = 2.0,
-    mask: Optional[np.ndarray] = None,
     debug_dir: Optional[Path] = None,
 ) -> List[Affine3x3]:
     gray_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
     transforms: List[Affine3x3] = [np.eye(3, dtype=np.float32)]
 
     h, w = gray_frames[0].shape
-    #mask to ignore most of the image so we wont get feature points around the subject but the background
-    if mask is None:
-        mask = np.ones((h, w), dtype=np.uint8) * 255
-        mask[int(h * 0.25) : int(h * 0.75), :] = 0
 
     total_pairs = len(gray_frames) - 1
     for i in progress_iter(range(1, len(gray_frames)), total=total_pairs, desc="Pairwise align"):
-        pts_prev, pts_curr = detect_and_match(gray_frames[i - 1], gray_frames[i], max_features=max_features, mask=mask)
-        M = estimate_affine(pts_curr, pts_prev, ransac_thresh=ransac_thresh)
+        pts_prev, pts_curr = detect_and_match(gray_frames[i - 1], gray_frames[i], max_features=max_features)
+        M = estimate_partial_affine(pts_curr, pts_prev, ransac_thresh=ransac_thresh)
         transforms.append(M)
 
         if debug_dir is not None and len(pts_prev) > 0 and _should_save_debug(i, total_pairs):

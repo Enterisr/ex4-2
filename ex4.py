@@ -11,8 +11,6 @@ from pipeline.io_utils import read_video_frames
 from pipeline.mosaic import (
     build_mosaic,
     compute_canvas_bounds,
-    compute_union_coverage_mask,
-    crop_with_mask,
     render_strip_sweep_video,
     write_video,
 )
@@ -63,15 +61,7 @@ def generate_outputs(
 ):
     stereo_baseline = args.stereo_baseline_ratio
 
-    coverage_mask = compute_union_coverage_mask(
-        frames,
-        global_stable,
-        canvas_size,
-        offset,
-        strip_ratio=args.strip_ratio,
-        strip_offsets=[0.0, -stereo_baseline, stereo_baseline],
-        vertical_scale=args.vertical_scale,
-    )
+
 
     with ThreadPoolExecutor(max_workers=mosaic_workers) as executor:
         mosaic_future = executor.submit(
@@ -123,10 +113,6 @@ def generate_outputs(
         left = left_future.result()
         right = right_future.result()
 
-    mosaic = crop_with_mask(mosaic, coverage_mask)
-    left = crop_with_mask(left, coverage_mask)
-    right = crop_with_mask(right, coverage_mask)
-
     def restore_orientation(img):
         if rotate_back_code is None:
             return img
@@ -159,7 +145,7 @@ def generate_outputs(
         output_path=sweep_path,
         num_workers=mosaic_workers,
         sweep_extent=max(0.05, stereo_baseline * 2.5),
-        steps=60,
+        steps=10,
         fps=max(10.0, fps),
         downsample_targets=[(1280, 720), (1920, 1080)],
         frame_postprocess=restore_orientation,
@@ -198,7 +184,7 @@ def main() -> None:
     pairwise = pairwise_transforms(
         frames,
         max_features=args.max_features,
-        ransac_thresh=3.0,
+        ransac_thresh=1.5,
         debug_dir=debug_dir / "features",
     )
     

@@ -74,7 +74,6 @@ def detect_and_match(
     gray_b: np.ndarray,
     max_features: int = 2000,
     keep: int = 400,
-    mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Detect Harris corners and track them with LK optical flow between frames."""
     corners = harris_corners(
@@ -83,7 +82,6 @@ def detect_and_match(
         quality_level=0.01,
         min_distance=6,
         block_size=9,
-        mask=mask,
     )
     if len(corners) < 4:
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
