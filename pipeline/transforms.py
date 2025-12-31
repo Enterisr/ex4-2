@@ -151,22 +151,6 @@ def local_to_global_transformations(pairwise: Sequence[Affine3x3]) -> List[Affin
     return globals_
 
 
-def lock_convergence_point(transforms: Sequence[Affine3x3], point: Optional[Tuple[float, float]]) -> List[Affine3x3]:
-    if point is None:
-        return list(transforms)
-    px, py = point
-    p = np.array([px, py], dtype=np.float32)
-    locked: List[Affine3x3] = []
-    for T in transforms:
-        R = T[:2, :2]
-        t = T[:2, 2]
-        adjust = (R - np.eye(2, dtype=np.float32)) @ p
-        new_t = t - adjust
-        new_T = T.copy()
-        new_T[:2, 2] = new_t
-        locked.append(new_T)
-    return locked
-
 
 def cancel_cumulative_rotation(transforms: Sequence[Affine3x3]) -> List[Affine3x3]:
     if not transforms:

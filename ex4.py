@@ -20,7 +20,6 @@ from pipeline.transforms import (
     cancel_cumulative_rotation,
     detrend_video,
     local_to_global_transformations,
-    lock_convergence_point,
     pairwise_transforms,
 )
 from pipeline.utils import resolve_workers
