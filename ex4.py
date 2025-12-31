@@ -73,6 +73,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If the input video is portrait, rotate it 90 degrees CCW for processing and rotate outputs back to portrait",
     )
+    parser.add_argument(
+        "--convergence-click",
+        type=int,
+        nargs=2,
+        metavar=("X", "Y"),
+        default=None,
+        help="Optional pixel (x y) in the reference sweep panorama to keep stationary",
+    )
+    parser.add_argument(
+        "--convergence-ref-index",
+        type=int,
+        default=None,
+        help="Optional reference panorama index for convergence alignment; defaults to the middle panorama",
+    )
+    parser.add_argument(
+        "--convergence-patch-radius",
+        type=int,
+        default=20,
+        help="Half-size of the square template patch used when locking the convergence point",
+    )
 
     return parser.parse_args()
 
@@ -176,6 +196,9 @@ def generate_outputs(
         downsample_targets=[(1280, 720), (1920, 1080)],
         frame_postprocess=restore_orientation,
         debug_dir=debug_dir,
+        convergence_click=tuple(args.convergence_click) if args.convergence_click else None,
+        convergence_reference_index=args.convergence_ref_index,
+        convergence_patch_radius=args.convergence_patch_radius,
     )
     print(f"Sweep video saved to: {sweep_path}")
     for ds_path, (ds_w, ds_h) in downsampled_sweeps:

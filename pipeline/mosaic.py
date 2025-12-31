@@ -98,6 +98,66 @@ def build_mosaic(
 
 
 
+def align_all_panoramas(
+    panoramas_list: Sequence[np.ndarray],
+    reference_index: int,
+    click_coords: Tuple[int, int],
+    patch_radius: int = 20,
+) -> list[np.ndarray]:
+    """
+    Align a list of panoramas so the chosen click coordinate is stationary.
+
+    panoramas_list: ordered left-to-right panoramas (HxWxC, BGR)
+    reference_index: anchor panorama index
+    click_coords: (x, y) coordinate selected in the reference panorama
+    patch_radius: half-size of the square template used for matching
+    """
+    if not panoramas_list:
+        return []
+
+    if reference_index < 0 or reference_index >= len(panoramas_list):
+        raise ValueError("reference_index is out of bounds for the panoramas list")
+
+    h_ref, w_ref = panoramas_list[reference_index].shape[:2]
+    x_click = int(round(click_coords[0]))
+    y_click = int(round(click_coords[1]))
+    x_click = max(0, min(w_ref - 1, x_click))
+    y_click = max(0, min(h_ref - 1, y_click))
+    patch_radius = max(1, int(patch_radius))
+
+    x0 = max(0, x_click - patch_radius)
+    x1 = min(w_ref, x_click + patch_radius + 1)
+    y0 = max(0, y_click - patch_radius)
+    y1 = min(h_ref, y_click + patch_radius + 1)
+
+    template = panoramas_list[reference_index][y0:y1, x0:x1]
+    if template.size == 0:
+        raise ValueError("Template patch is empty; check click coordinates and patch radius")
+
+    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY) if template.ndim == 3 else template
+
+    aligned: list[np.ndarray] = []
+    for idx, pano in enumerate(panoramas_list):
+        if pano.shape[:2] != (h_ref, w_ref):
+            raise ValueError("All panoramas must share the same spatial resolution")
+
+        if idx == reference_index:
+            aligned.append(pano)
+            continue
+
+        pano_gray = cv2.cvtColor(pano, cv2.COLOR_BGR2GRAY) if pano.ndim == 3 else pano
+        match_map = cv2.matchTemplate(pano_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+        _, _, _, max_loc = cv2.minMaxLoc(match_map)
+
+        matched_center_x = max_loc[0] + template_gray.shape[1] * 0.5
+        horizontal_shift = int(round(x_click - matched_center_x))
+
+        aligned.append(np.roll(pano, shift=horizontal_shift, axis=1))
+
+    return aligned
+
+
+
 def render_strip_sweep_video(
     frames: Sequence[np.ndarray],
     transforms_smooth: Sequence[Affine3x3],
@@ -114,6 +174,9 @@ def render_strip_sweep_video(
     downsample_targets: Sequence[Tuple[int, int]] | None = None,
     frame_postprocess: Callable[[np.ndarray], np.ndarray] | None = None,
     debug_dir: Path | None = None,
+    convergence_click: Tuple[int, int] | None = None,
+    convergence_reference_index: int | None = None,
+    convergence_patch_radius: int = 20,
 ) -> list[tuple[Path, tuple[int, int]]]:
     def apply_post(img: np.ndarray) -> np.ndarray:
         return frame_postprocess(img) if frame_postprocess else img
@@ -143,7 +206,7 @@ def render_strip_sweep_video(
         debug_tag="sweep_first",
         pre_warped_frames=pre_warped_frames,
     )
-    first = first
+    first = apply_post(first)
     h, w = first.shape[:2]
     mosaics: list[np.ndarray] = [first]
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -172,7 +235,15 @@ def render_strip_sweep_video(
             mosaic = fut.result()
             mosaics.append(apply_post(mosaic))
 
-   
+    if convergence_click is not None:
+        ref_idx = convergence_reference_index if convergence_reference_index is not None else len(mosaics) // 2
+        mosaics = align_all_panoramas(
+            mosaics,
+            reference_index=ref_idx,
+            click_coords=convergence_click,
+            patch_radius=convergence_patch_radius,
+        )
+
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
     if not writer.isOpened():
         print(f"Warning: failed to open sweep VideoWriter for {output_path}")
