@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Callable, Sequence, Tuple
 
 import cv2
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import numpy as np
 
 from .types import Affine3x3
@@ -26,7 +29,11 @@ def _build_strip_mask(height: int, width: int, strip_ratio: float, strip_x_offse
 
 
 
-def compute_canvas_bounds(frames: Sequence[np.ndarray], transforms: Sequence[Affine3x3]) -> Tuple[Tuple[int, int], np.ndarray]:
+def compute_canvas_bounds(
+    frames: Sequence[np.ndarray],
+    transforms: Sequence[Affine3x3],
+    debug_dir: Path | None = None,
+) -> Tuple[Tuple[int, int], np.ndarray]:
     h, w = frames[0].shape[:2]
     corners = np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1]], dtype=np.float32).T
     xs = []
@@ -41,6 +48,25 @@ def compute_canvas_bounds(frames: Sequence[np.ndarray], transforms: Sequence[Aff
     width = int(math.ceil(max_x - min_x))
     height = int(math.ceil(max_y - min_y))
     offset = np.array([-min_x, -min_y], dtype=np.float32)
+
+    if debug_dir is not None:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        xs_arr = np.asarray(xs, dtype=np.float32)
+        ys_arr = np.asarray(ys, dtype=np.float32)
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.scatter(xs_arr, ys_arr, s=6, alpha=0.35, c="tab:blue", label="warped corners")
+        rect = plt.Rectangle((min_x, min_y), width, height, fill=False, color="tab:red", linewidth=2, label="canvas bounds")
+        ax.add_patch(rect)
+        ax.scatter([0], [0], c="tab:orange", s=20, label="origin (0,0)")
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+        ax.legend(loc="best")
+        ax.set_title("Canvas bounds from warped frame corners")
+        ax.set_xlabel("x (px)")
+        ax.set_ylabel("y (px)")
+        fig.tight_layout()
+        fig.savefig(debug_dir / "canvas_bounds.png", dpi=200)
+        plt.close(fig)
     return (height, width), offset
 
 
@@ -61,7 +87,6 @@ def build_mosaic(
     vertical_scale: float = 1.0,
     debug_dir: Path | None = None,
     debug_tag: str | None = None,
-    pre_warped_frames: Sequence[np.ndarray] | None = None,
 ) -> np.ndarray:
     h, orig_width = frames[0].shape[:2]
     mask = _build_strip_mask(h, orig_width, strip_ratio, strip_x_offset)
@@ -70,11 +95,9 @@ def build_mosaic(
     acc = np.zeros((canvas_size[0], canvas_size[1], 3), dtype=np.float32)
     count_of_strips_per_px = np.zeros((canvas_size[0], canvas_size[1], 1), dtype=np.float32)
 
-    def warp_task(frame: np.ndarray, warped_frame_cache: np.ndarray | None, T_smooth: Affine3x3):
-        # Reuse cached warped frame when available to avoid re-warping per offset.
-        warped_frame = warped_frame_cache
-        if warped_frame is None:
-            warped_frame = warp_frame(frame, T_smooth, canvas_size, offset, border_value=(0, 0, 0)).astype(np.float32)
+    def warp_task(frame: np.ndarray, T_smooth: Affine3x3):
+        # Warp frame to transformed location after stabilization.
+        warped_frame = warp_frame(frame, T_smooth, canvas_size, offset, border_value=(0, 0, 0)).astype(np.float32)
 
         # Warp the mask to keep it in the transformed location after stabilization.
         warped_mask = warp_frame(mask, T_smooth, canvas_size, offset, border_value=0)
@@ -84,8 +107,7 @@ def build_mosaic(
     for idx, (frame, T_clean, _) in enumerate(
         progress_iter(zip(frames, transforms_smooth, transforms_noisy), total=len(frames), desc="Blending strips")
     ):
-        cache_frame = pre_warped_frames[idx] if pre_warped_frames is not None else None
-        final_strip, w_map = warp_task(frame, cache_frame, T_clean)
+        final_strip, w_map = warp_task(frame, T_clean)
         acc += final_strip
         count_of_strips_per_px += w_map
 
@@ -187,12 +209,6 @@ def render_strip_sweep_video(
     strip_locations = np.concatenate([strip_locations, strip_locations[-2:0:-1]])
 
 
-    # Pre-warp frames once so each sweep offset only needs to warp the mask.
-    pre_warped_frames = [
-        warp_frame(frame, T_clean, canvas_size, offset, border_value=(0, 0, 0)).astype(np.float32)
-        for frame, T_clean in zip(frames, transforms_smooth)
-    ]
-
     first = build_mosaic(
         frames,
         transforms_smooth,
@@ -204,7 +220,6 @@ def render_strip_sweep_video(
         vertical_scale=vertical_scale,
         debug_dir=debug_dir,
         debug_tag="sweep_first",
-        pre_warped_frames=pre_warped_frames,
     )
     first = apply_post(first)
     h, w = first.shape[:2]
@@ -227,7 +242,6 @@ def render_strip_sweep_video(
                     vertical_scale,
                     None,
                     None,
-                    pre_warped_frames,
                 )
             )
 

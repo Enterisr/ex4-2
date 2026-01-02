@@ -167,6 +167,23 @@ def generate_outputs(
     left = restore_orientation(left)
     right = restore_orientation(right)
 
+    # Apply zoom for stereo effect when convergence-click is supplied
+    if args.convergence_click:
+        zoom_factor = 1.3
+        print(f"Applying {zoom_factor}x zoom for stereo effect (convergence mode)")
+        
+        def zoom_image(img, factor):
+            h, w = img.shape[:2]
+            new_h, new_w = int(h / factor), int(w / factor)
+            y_start = (h - new_h) // 2
+            x_start = (w - new_w) // 2
+            cropped = img[y_start:y_start + new_h, x_start:x_start + new_w]
+            return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+        
+        mosaic = zoom_image(mosaic, zoom_factor)
+        left = zoom_image(left, zoom_factor)
+        right = zoom_image(right, zoom_factor)
+
     mosaic_path = run_dir / f"{args.input.stem}_mosaic.png"
     cv2.imwrite(str(mosaic_path), mosaic)
     print(f"Mosaic saved to: {mosaic_path}")
@@ -260,7 +277,7 @@ def generate_panorama(input_frames_path, n_out_frames):
 
     # Generate n_out_frames panorama frames using sweep video technique
     # We'll generate frames by sweeping the strip position
-    strip_ratio = 0.10
+    strip_ratio = 0.06
     vertical_scale = 1.0
 
     panorama_frames = []
@@ -302,6 +319,11 @@ def main() -> None:
     frames = read_video_frames(
         args.input, max_frames=args.max_frames, stride=args.stride
     )
+    if not frames:
+        raise RuntimeError("No frames loaded; check input path and stride/max-frames settings")
+
+    h, w = frames[0].shape[:2]
+    print(f"Loaded {len(frames)} frames from {args.input} at {w}x{h} (stride={args.stride}, max={args.max_frames})")
     fps = cv2.VideoCapture(str(args.input)).get(cv2.CAP_PROP_FPS) or 25.0
 
     rotate_back_code = None
@@ -328,8 +350,9 @@ def main() -> None:
         frames,
         max_features=args.max_features,
         ransac_thresh=1.5,
-        debug_dir=debug_dir / "features",
+        debug_dir=debug_dir,
     )
+    print(f"Pairwise feature/RANSAC debug saved to {debug_dir / 'features'} and {debug_dir / 'ransac'}")
 
     pairwise = cancel_cumulative_rotation(pairwise)
 
@@ -343,9 +366,12 @@ def main() -> None:
         smooth_scale=False,
         detrend_y=True,
         detrend_angle=True,
+        debug_dir=debug_dir / "detrend",
     )
+    print(f"Detrend debug plot: {debug_dir / 'detrend' / 'detrend_debug.png'}")
 
-    canvas_size, offset = compute_canvas_bounds(frames, global_stable)
+    canvas_size, offset = compute_canvas_bounds(frames, global_stable, debug_dir=debug_dir / "canvas")
+    print(f"Canvas size {canvas_size}, offset {offset}")
 
     generate_outputs(
         frames,
