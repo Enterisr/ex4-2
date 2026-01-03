@@ -369,25 +369,23 @@ def detrend_video(
 # Mosaic Building
 # ============================================================================
 
-def compute_canvas_bounds(
+def compute_slit_scan_canvas_bounds(
     frames: Sequence[np.ndarray],
     transforms: Sequence[np.ndarray],
 ) -> Tuple[Tuple[int, int], np.ndarray]:
     h, w = frames[0].shape[:2]
-    corners = np.array(
-        [[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1]], dtype=np.float32
-    ).T
-    xs = []
-    ys = []
+    txs = []
+    tys = []
     for T in transforms:
-        warped = T @ corners
-        xs.extend(warped[0])
-        ys.extend(warped[1])
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    width = int(math.ceil(max_x - min_x))
-    height = int(math.ceil(max_y - min_y))
-    offset = np.array([-min_x, -min_y], dtype=np.float32)
+        txs.append(T[0, 2])
+        tys.append(T[1, 2])
+    
+    min_tx, max_tx = min(txs), max(txs)
+    min_ty, max_ty = min(tys), max(tys)
+    
+    width = int(math.ceil(max_tx - min_tx)) + 10
+    height = int(math.ceil(max_ty - min_ty)) + h
+    offset = np.array([-min_tx, -min_ty], dtype=np.float32)
     return (height, width), offset
 
 
@@ -410,48 +408,118 @@ def warp_frame(
     )
 
 
-def build_strip_mask(
-    height: int, width: int, strip_ratio: float, strip_x_offset: float
-) -> np.ndarray:
-    strip_width = max(4, int(width * strip_ratio))
-    strip_x = width * (0.5 + strip_x_offset)
-    left_x_strip = int(strip_x - strip_width * 0.5)
-    left_x_strip = max(0, min(width - strip_width, left_x_strip))
-
-    mask = np.zeros((height, width), dtype=np.uint8)
-    mask[:, left_x_strip : left_x_strip + strip_width] = 255
-    return mask
-
-
-def build_mosaic(
+def build_slit_scan_mosaic(
     frames: Sequence[np.ndarray],
     transforms_smooth: Sequence[np.ndarray],
-    transforms_noisy: Sequence[np.ndarray],
-    strip_ratio: float,
     canvas_size: Tuple[int, int],
     offset: np.ndarray,
-    strip_x_offset: float = 0.0,
-    vertical_scale: float = 1.0,
+    slit_x_offset_ratio: float = 0.0,
+    slit_width: int = 1,
+    stabilize_vertical: bool = True,
 ) -> np.ndarray:
-    h, orig_width = frames[0].shape[:2]
-    mask = build_strip_mask(h, orig_width, strip_ratio, strip_x_offset)
+    """
+    Build a Stabilized Slit-Scan (Time-Panorama) with continuous surface filling.
+    
+    Fills the entire horizontal range between consecutive frames to eliminate gaps.
+    Uses tx for horizontal positioning and ty for vertical alignment.
+    
+    Args:
+        frames: Input video frames
+        transforms_smooth: Smooth transformation matrices (3x3) for each frame
+        canvas_size: (height, width) of the output canvas
+        offset: Translation offset to apply to transformations
+        slit_x_offset_ratio: Horizontal offset ratio for slit extraction (0.0 = center)
+        slit_width: Width of the slit in pixels (default=1)
+        stabilize_vertical: Use vertical displacement for stabilization (default: True)
+    
+    Returns:
+        Slit-scan mosaic image (canvas_size[0] x canvas_size[1] x 3)
+    """
+    h, w = frames[0].shape[:2]
+    canvas_h, canvas_w = canvas_size
+    
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    coverage = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    
+    slit_x_src = int(w * (0.5 + slit_x_offset_ratio))
+    slit_x_src = max(0, min(w - 1, slit_x_src))
+    
+    x_prev = None
+    
+    for frame_idx, (frame, T_smooth) in enumerate(zip(frames, transforms_smooth)):
+        M = T_smooth[:2, :].copy()
+        M[:, 2] += offset
+        
+        tx = M[0, 2]
+        ty = M[1, 2]
+        
+        x_curr = int(round(tx))
+        
+        if stabilize_vertical:
+            y_offset_curr = int(round(ty))
+        else:
+            y_offset_curr = 0
+        
+        if x_prev is None:
+            x_prev = x_curr
+            continue
 
-    acc = np.zeros((canvas_size[0], canvas_size[1], 3), dtype=np.float32)
-    count_of_strips_per_px = np.zeros((canvas_size[0], canvas_size[1], 1), dtype=np.float32)
-
-    for frame, T_smooth in zip(frames, transforms_smooth):
-        warped_frame = warp_frame(
-            frame, T_smooth, canvas_size, offset, border_value=(0, 0, 0)
-        ).astype(np.float32)
-        warped_mask = warp_frame(mask, T_smooth, canvas_size, offset, border_value=0)
-        m = (warped_mask > 0).astype(np.float32)[..., None]
-        acc += warped_frame * m
-        count_of_strips_per_px += m
-
-    count_of_strips_per_px[count_of_strips_per_px == 0] = 1.0
-    mosaic = (acc / count_of_strips_per_px).astype(np.uint8)
-
-    return mosaic
+        # Determine range to fill
+        if x_curr > x_prev:
+            x_start = x_prev
+            x_end = x_curr if frame_idx == len(frames) - 1 else x_curr - 1
+        elif x_curr < x_prev:
+            x_start = x_curr if frame_idx == len(frames) - 1 else x_curr + 1
+            x_end = x_prev
+        else:
+            x_start = x_prev
+            x_end = x_prev
+        
+        x_start = max(0, x_start)
+        x_end = min(canvas_w - 1, x_end)
+        
+        if x_start <= x_end:
+            fill_width = x_end - x_start + 1
+            
+            # Extract from source frame
+            extract_width = max(1, min(fill_width, w - 1))
+            extract_start = max(0, min(w - extract_width, slit_x_src - extract_width // 2))
+            slit_strip = frame[:, extract_start:extract_start + extract_width, :]
+            
+            # Resize to fill width
+            if fill_width != extract_width:
+                slit_strip = cv2.resize(slit_strip, (fill_width, h), interpolation=cv2.INTER_LINEAR)
+            
+            y_offset = y_offset_curr
+            
+            y_start_dst = max(0, y_offset)
+            y_end_dst = min(canvas_h, y_offset + h)
+            
+            y_start_src = max(0, -y_offset)
+            y_end_src = min(h, canvas_h - y_offset)
+            
+            if y_start_dst < y_end_dst and y_start_src < y_end_src:
+                strip_to_place = slit_strip[y_start_src:y_end_src, :, :]
+                
+                # Blend in overlap zones smoothly using addWeighted
+                for xi in range(fill_width):
+                    x_canvas = x_start + xi
+                    if 0 <= x_canvas < canvas_w:
+                        if coverage[y_start_dst:y_end_dst, x_canvas].max() > 0:
+                            # Blend with existing content
+                            alpha = 0.5
+                            canvas[y_start_dst:y_end_dst, x_canvas, :] = cv2.addWeighted(
+                                canvas[y_start_dst:y_end_dst, x_canvas, :], 1 - alpha,
+                                strip_to_place[:, xi, :], alpha, 0
+                            ).astype(np.uint8)
+                        else:
+                            # First coverage at this x position
+                            canvas[y_start_dst:y_end_dst, x_canvas, :] = strip_to_place[:, xi, :]
+                        coverage[y_start_dst:y_end_dst, x_canvas] = 1
+        
+        x_prev = x_curr
+    
+    return canvas
 
 
 def align_all_panoramas(
@@ -508,104 +576,175 @@ def align_all_panoramas(
         matched_center_x = max_loc[0] + template_gray.shape[1] * 0.5
         horizontal_shift = int(round(x_click - matched_center_x))
 
-        aligned.append(np.roll(pano, shift=horizontal_shift, axis=1))
+        # Use translation matrix instead of roll to avoid wrap-around
+        M = np.float32([[1, 0, horizontal_shift], [0, 1, 0]])
+        shifted = cv2.warpAffine(pano, M, (pano.shape[1], pano.shape[0]), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        aligned.append(shifted)
 
     return aligned
+
+
+def align_stereo_pair(
+    left: np.ndarray,
+    right: np.ndarray,
+    convergence_point: Tuple[int, int],
+    patch_radius: int = 20,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Align a stereo pair so the convergence point has zero disparity.
+    
+    Standard stereo alignment: keep left image as reference, shift only the right image.
+    Black borders are normal and should be cropped to the common viewing area.
+    
+    This creates a natural 3D effect where:
+    - Objects at the convergence point have zero disparity (appear on screen plane)
+    - Objects behind have positive disparity (appear behind screen)
+    - Objects in front have negative disparity (appear in front of screen)
+    
+    Args:
+        left: Left panorama image (kept as reference)
+        right: Right panorama image (will be shifted)
+        convergence_point: (x, y) coordinate in left image to use as convergence point
+        patch_radius: Radius of template patch for matching
+    
+    Returns:
+        Tuple of (left, aligned_right) images
+    """
+    if left.shape != right.shape:
+        raise ValueError("Left and right images must have the same dimensions")
+    
+    h, w = left.shape[:2]
+    x_click = int(round(convergence_point[0]))
+    y_click = int(round(convergence_point[1]))
+    x_click = max(patch_radius, min(w - patch_radius - 1, x_click))
+    y_click = max(patch_radius, min(h - patch_radius - 1, y_click))
+    
+    # Extract template from left image
+    x0 = max(0, x_click - patch_radius)
+    x1 = min(w, x_click + patch_radius + 1)
+    y0 = max(0, y_click - patch_radius)
+    y1 = min(h, y_click + patch_radius + 1)
+    
+    template = left[y0:y1, x0:x1]
+    if template.size == 0:
+        return left, right
+    
+    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY) if template.ndim == 3 else template
+    right_gray = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY) if right.ndim == 3 else right
+    
+    # Find matching point in right image
+    match_map = cv2.matchTemplate(right_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+    _, _, _, max_loc = cv2.minMaxLoc(match_map)
+    
+    matched_center_x = max_loc[0] + template_gray.shape[1] * 0.5
+    
+    # Calculate shift: align the matched point in right to the convergence point position
+    horizontal_shift = int(round(x_click - matched_center_x))
+    
+    # Shift only the right image (left stays as reference)
+    # Black borders are expected in stereo - crop to common area for viewing
+    M = np.float32([[1, 0, horizontal_shift], [0, 1, 0]])
+    aligned_right = cv2.warpAffine(right, M, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    
+    return left, aligned_right
 
 
 def render_strip_sweep_video(
     frames: Sequence[np.ndarray],
     transforms_smooth: Sequence[np.ndarray],
-    transforms_noisy: Sequence[np.ndarray],
     canvas_size: Tuple[int, int],
     offset: np.ndarray,
-    strip_ratio: float,
-    vertical_scale: float,
     output_path: Path,
     sweep_extent: float = 0.4,
-    steps: int = 60,
+    steps: int = 100,
     fps: float = 10,
-    downsample_targets: Sequence[Tuple[int, int]] | None = None,
-    convergence_click: Tuple[int, int] | None = None,
-    convergence_reference_index: int | None = None,
-    convergence_patch_radius: int = 20,
-) -> List[Tuple[Path, Tuple[int, int]]]:
+    slit_width: int = 1,
+    convergence_point: Optional[Tuple[int, int]] = None,
+    patch_radius: int = 20,
+) -> None:
     """
     Render a sweep video by varying the strip position with bounce effect.
-    Optionally applies convergence alignment and downsampling.
+    
+    Args:
+        frames: Input video frames
+        transforms_smooth: Smooth transformation matrices
+        canvas_size: Output canvas size (height, width)
+        offset: Translation offset for transformations
+        output_path: Path to save output video
+        sweep_extent: Maximum sweep offset ratio
+        steps: Number of sweep steps (one direction)
+        fps: Output video frame rate
+        slit_width: Width of slit in pixels
+        convergence_point: Optional (x, y) point for stereo convergence alignment.
+                          If None, images remain aligned at infinity (default behavior).
+                          If specified, stereo pairs are aligned so this point has zero disparity.
+        patch_radius: Radius of template patch for convergence point matching
     """
     strip_locations = np.linspace(-abs(sweep_extent), abs(sweep_extent), steps)
-    # Build a bounce sequence so the sweep plays forward and then backward
     strip_locations = np.concatenate([strip_locations, strip_locations[-2:0:-1]])
 
-    # Build all mosaics
     mosaics: List[np.ndarray] = []
-    for center_ratio in strip_locations:
-        mosaic = build_mosaic(
-            frames,
-            transforms_smooth,
-            transforms_noisy,
-            strip_ratio,
-            canvas_size,
-            offset,
-            center_ratio,
-            vertical_scale,
-        )
-        mosaics.append(mosaic)
+    
+    # If convergence point is specified, we need to generate stereo pairs and align them
+    if convergence_point is not None:
+        # Generate pairs of mosaics (left, right) and align them
+        for i in range(0, len(strip_locations) - 1, 2):
+            left_ratio = strip_locations[i]
+            right_ratio = strip_locations[i + 1] if i + 1 < len(strip_locations) else strip_locations[i]
+            
+            # Generate left and right mosaics
+            left = build_slit_scan_mosaic(
+                frames,
+                transforms_smooth,
+                canvas_size,
+                offset,
+                slit_x_offset_ratio=left_ratio,
+                slit_width=slit_width,
+                stabilize_vertical=True,
+            )
+            right = build_slit_scan_mosaic(
+                frames,
+                transforms_smooth,
+                canvas_size,
+                offset,
+                slit_x_offset_ratio=right_ratio,
+                slit_width=slit_width,
+                stabilize_vertical=True,
+            )
+            
+            # Align based on convergence point
+            left_aligned, right_aligned = align_stereo_pair(
+                left, right, convergence_point, patch_radius
+            )
+            
+            # Add both to mosaics
+            mosaics.append(left_aligned)
+            if i + 1 < len(strip_locations):
+                mosaics.append(right_aligned)
+    else:
+        # Default behavior: no convergence alignment (infinity convergence)
+        for center_ratio in strip_locations:
+            mosaic = build_slit_scan_mosaic(
+                frames,
+                transforms_smooth,
+                canvas_size,
+                offset,
+                slit_x_offset_ratio=center_ratio,
+                slit_width=slit_width,
+                stabilize_vertical=True,
+            )
+            mosaics.append(mosaic)
 
-    # Apply convergence alignment if requested
-    if convergence_click is not None:
-        ref_idx = convergence_reference_index if convergence_reference_index is not None else len(mosaics) // 2
-        mosaics = align_all_panoramas(
-            mosaics,
-            reference_index=ref_idx,
-            click_coords=convergence_click,
-            patch_radius=convergence_patch_radius,
-        )
-
-    # Write main video
+    # Write video
     h, w = mosaics[0].shape[:2]
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
     if not writer.isOpened():
-        return []
+        return
 
     for mosaic in mosaics:
         writer.write(mosaic)
     writer.release()
-
-    # Write downsampled versions
-    downsample_outputs: List[Tuple[Path, Tuple[int, int]]] = []
-    for target_w, target_h in downsample_targets or []:
-        if target_w <= 0 or target_h <= 0:
-            continue
-
-        scale = min(target_w / w, target_h / h, 1.0)
-        new_w = max(2, int(round(w * scale)))
-        new_h = max(2, int(round(h * scale)))
-        new_w = min(target_w, new_w)
-        new_h = min(target_h, new_h)
-
-        if new_w % 2 != 0:
-            new_w -= 1
-        if new_h % 2 != 0:
-            new_h -= 1
-
-        if new_w < 2 or new_h < 2:
-            continue
-
-        target_path = output_path.with_name(f"{output_path.stem}_{target_h}p{output_path.suffix}")
-        ds_writer = cv2.VideoWriter(str(target_path), fourcc, fps, (new_w, new_h))
-        if not ds_writer.isOpened():
-            continue
-
-        for mosaic in mosaics:
-            downsampled = cv2.resize(mosaic, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            ds_writer.write(downsampled)
-        ds_writer.release()
-        downsample_outputs.append((target_path, (new_w, new_h)))
-
-    return downsample_outputs
 
 
 # ============================================================================
@@ -660,36 +799,30 @@ def generate_panorama(input_frames_path, n_out_frames):
         detrend_angle=True,
     )
 
-    # Compute canvas bounds
-    canvas_size, offset = compute_canvas_bounds(frames, global_stable)
+    canvas_size, offset = compute_slit_scan_canvas_bounds(frames, global_stable)
 
-    # Generate n_out_frames panorama frames using sweep video technique
-    # We'll generate frames by sweeping the strip position
-    strip_ratio = 0.06
-    vertical_scale = 1.0
-
-    # Create sweep positions for n_out_frames
+    # Generate n_out_frames panorama frames using slit-scan technique
+    # Create sweep positions for n_out_frames to support stereo/multi-view output
     baseline = 0.08  # Default stereo baseline
     sweep_extent = max(0.05, baseline * 2.5)
     
     # Generate exactly n_out_frames with linear sweep from left to right
     if n_out_frames == 1:
-        strip_locations = [0.0]
+        slit_offsets = [0.0]
     else:
-        strip_locations = list(np.linspace(-abs(sweep_extent), abs(sweep_extent), n_out_frames))
+        slit_offsets = list(np.linspace(-abs(sweep_extent), abs(sweep_extent), n_out_frames))
 
-    # Generate panorama frames
+    # Generate panorama frames using slit-scan approach
     panorama_frames = []
-    for strip_offset in strip_locations:
-        mosaic = build_mosaic(
+    for slit_offset in slit_offsets:
+        mosaic = build_slit_scan_mosaic(
             frames,
             global_stable,
-            global_noisy,
-            strip_ratio,
             canvas_size,
             offset,
-            strip_offset,
-            vertical_scale,
+            slit_x_offset_ratio=slit_offset,
+            slit_width=1,
+            stabilize_vertical=True,
         )
 
         mosaic_rgb = cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB)
@@ -725,16 +858,7 @@ def parse_args() -> argparse.Namespace:
         "--stride", type=int, default=1, help="Frame stride for subsampling"
     )
     parser.add_argument(
-        "--strip-ratio", type=float, default=0.10, help="Strip width ratio"
-    )
-    parser.add_argument(
-        "--vertical-scale", type=float, default=1.0, help="Vertical scale factor"
-    )
-    parser.add_argument(
-        "--max-features", type=int, default=1000, help="feature budget per frame"
-    )
-    parser.add_argument(
-        "--blend-workers", type=int, default=0, help="Worker threads for strip blending"
+        "--max-features", type=int, default=500, help="feature budget per frame"
     )
     parser.add_argument(
         "--smooth-radius", type=int, default=25, help="Radius for trajectory smoothing"
@@ -751,29 +875,21 @@ def parse_args() -> argparse.Namespace:
         help="If the input video is portrait, rotate it 90 degrees CCW for processing and rotate outputs back to portrait",
     )
     parser.add_argument(
-        "--convergence-click",
-        type=int,
-        nargs=2,
-        metavar=("X", "Y"),
-        default=None,
-        help="Optional pixel (x y) in the reference sweep panorama to keep stationary",
-    )
-    parser.add_argument(
-        "--convergence-ref-index",
-        type=int,
-        default=None,
-        help="Optional reference panorama index for convergence alignment; defaults to the middle panorama",
-    )
-    parser.add_argument(
-        "--convergence-patch-radius",
-        type=int,
-        default=20,
-        help="Half-size of the square template patch used when locking the convergence point",
-    )
-    parser.add_argument(
         "--save-outputs",
         action="store_true",
         help="Save output files (disabled by default for fast testing)",
+    )
+    parser.add_argument(
+        "--slit-width",
+        type=int,
+        default=3,
+        help="Width of slit in pixels for slit-scan method (default=3)",
+    )
+    parser.add_argument(
+        "--convergence-point",
+        type=str,
+        default=None,
+        help="Convergence point for stereo alignment as 'x,y' (e.g., '500,300'). If not set, convergence is at infinity.",
     )
 
     return parser.parse_args()
@@ -782,50 +898,51 @@ def parse_args() -> argparse.Namespace:
 def generate_outputs(
     frames,
     global_stable,
-    global_noisy,
     canvas_size,
     offset,
     args,
     fps,
     run_dir,
     rotate_back_code=None,
+    convergence_point=None,
 ):
     """Generate all outputs (mosaics, stereo pair, sweep video)"""
     stereo_baseline = args.stereo_baseline_ratio
 
-    # Build main mosaic
-    mosaic = build_mosaic(
+    # Build main slit-scan mosaic
+    mosaic = build_slit_scan_mosaic(
         frames,
         global_stable,
-        global_noisy,
-        args.strip_ratio,
         canvas_size,
         offset,
-        0.0,
-        args.vertical_scale,
+        slit_x_offset_ratio=0.0,
+        slit_width=args.slit_width,
+        stabilize_vertical=True,
     )
 
-    # Build stereo pair
-    left = build_mosaic(
+    # Build stereo pair using slit-scan
+    left = build_slit_scan_mosaic(
         frames,
         global_stable,
-        global_noisy,
-        args.strip_ratio,
         canvas_size,
         offset,
-        -stereo_baseline,
-        args.vertical_scale,
+        slit_x_offset_ratio=-stereo_baseline,
+        slit_width=args.slit_width,
+        stabilize_vertical=True,
     )
-    right = build_mosaic(
+    right = build_slit_scan_mosaic(
         frames,
         global_stable,
-        global_noisy,
-        args.strip_ratio,
         canvas_size,
         offset,
-        stereo_baseline,
-        args.vertical_scale,
+        slit_x_offset_ratio=stereo_baseline,
+        slit_width=args.slit_width,
+        stabilize_vertical=True,
     )
+    
+    # Apply convergence point alignment if specified
+    if convergence_point is not None:
+        left, right = align_stereo_pair(left, right, convergence_point, patch_radius=20)
 
     def restore_orientation(img):
         if rotate_back_code is None:
@@ -835,22 +952,6 @@ def generate_outputs(
     mosaic = restore_orientation(mosaic)
     left = restore_orientation(left)
     right = restore_orientation(right)
-
-    # Apply zoom for stereo effect when convergence-click is supplied
-    if args.convergence_click:
-        zoom_factor = 1.3
-        
-        def zoom_image(img, factor):
-            h, w = img.shape[:2]
-            new_h, new_w = int(h / factor), int(w / factor)
-            y_start = (h - new_h) // 2
-            x_start = (w - new_w) // 2
-            cropped = img[y_start:y_start + new_h, x_start:x_start + new_w]
-            return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-        
-        mosaic = zoom_image(mosaic, zoom_factor)
-        left = zoom_image(left, zoom_factor)
-        right = zoom_image(right, zoom_factor)
 
     # Save outputs only if requested
     if args.save_outputs:
@@ -865,26 +966,64 @@ def generate_outputs(
         print(f"Stereo images saved to: {left_path}, {right_path}")
 
         sweep_path = run_dir / f"{args.input.stem}_sweep.mp4"
-        downsampled_sweeps = render_strip_sweep_video(
+        render_strip_sweep_video(
             frames,
             global_stable,
-            global_noisy,
             canvas_size,
             offset,
-            strip_ratio=args.strip_ratio,
-            vertical_scale=args.vertical_scale,
             output_path=sweep_path,
             sweep_extent=max(0.05, stereo_baseline * 2.5),
-            steps=10,
+            steps=60,
             fps=max(10.0, fps),
-            downsample_targets=[(1280, 720), (1920, 1080)],
-            convergence_click=tuple(args.convergence_click) if args.convergence_click else None,
-            convergence_reference_index=args.convergence_ref_index,
-            convergence_patch_radius=args.convergence_patch_radius,
+            slit_width=args.slit_width,
+            convergence_point=convergence_point,
+            patch_radius=20,
         )
         print(f"Sweep video saved to: {sweep_path}")
-        for ds_path, (ds_w, ds_h) in downsampled_sweeps:
-            print(f"Downsampled sweep saved to: {ds_path} ({ds_w}x{ds_h})")
+        
+        # Create downsampled versions of sweep video
+        downsample_targets = [(1280, 720), (1920, 1080)]
+        cap = cv2.VideoCapture(str(sweep_path))
+        if cap.isOpened():
+            orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            
+            for target_w, target_h in downsample_targets:
+                if target_w <= 0 or target_h <= 0:
+                    continue
+                
+                scale = min(target_w / orig_w, target_h / orig_h, 1.0)
+                new_w = max(2, int(round(orig_w * scale)))
+                new_h = max(2, int(round(orig_h * scale)))
+                new_w = min(target_w, new_w)
+                new_h = min(target_h, new_h)
+                
+                if new_w % 2 != 0:
+                    new_w -= 1
+                if new_h % 2 != 0:
+                    new_h -= 1
+                
+                if new_w < 2 or new_h < 2 or (new_w == orig_w and new_h == orig_h):
+                    continue
+                
+                target_path = run_dir / f"{args.input.stem}_sweep_{target_h}p.mp4"
+                cap_read = cv2.VideoCapture(str(sweep_path))
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                ds_writer = cv2.VideoWriter(str(target_path), fourcc, max(10.0, fps), (new_w, new_h))
+                
+                if ds_writer.isOpened():
+                    while True:
+                        ret, frame = cap_read.read()
+                        if not ret:
+                            break
+                        downsampled = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                        ds_writer.write(downsampled)
+                    ds_writer.release()
+                    print(f"Downsampled sweep saved to: {target_path} ({new_w}x{new_h})")
+                
+                cap_read.release()
     else:
         print("Output generation complete (files not saved - use --save-outputs to save)")
 
@@ -952,20 +1091,30 @@ def main() -> None:
     )
 
     print("Computing canvas bounds...")
-    canvas_size, offset = compute_canvas_bounds(frames, global_stable)
+    canvas_size, offset = compute_slit_scan_canvas_bounds(frames, global_stable)
     print(f"Canvas size {canvas_size}, offset {offset}")
+
+    # Parse convergence point if provided
+    convergence_point = None
+    if args.convergence_point:
+        try:
+            x, y = map(int, args.convergence_point.split(','))
+            convergence_point = (x, y)
+            print(f"Using convergence point: ({x}, {y})")
+        except ValueError:
+            print(f"Warning: Invalid convergence point format '{args.convergence_point}'. Expected 'x,y'. Using infinity convergence.")
 
     print("Generating outputs...")
     generate_outputs(
         frames,
         global_stable,
-        global_noisy,
         canvas_size,
         offset,
         args,
         fps,
         run_dir,
         rotate_back_code,
+        convergence_point,
     )
 
     if args.stabilized_video and args.save_outputs:
@@ -978,7 +1127,7 @@ def main() -> None:
         )
         write_video(
             frames,
-            global_noisy,
+            global_stable,
             canvas_size,
             offset,
             stabilized_path,
