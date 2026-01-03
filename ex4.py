@@ -1,12 +1,76 @@
 from __future__ import annotations
 
+import argparse
 import math
+import os
+from datetime import datetime
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def resolve_workers(value: Optional[int]) -> int:
+    """Resolve worker count, limiting to a sensible CPU bound when value is missing or zero."""
+    if value is None or value == 0:
+        return max(1, min(8, os.cpu_count() or 1))
+    return max(1, value)
+
+
+def read_video_frames(
+    path: Path, max_frames: Optional[int] = None, stride: int = 1
+) -> List[np.ndarray]:
+    """Read frames from a video, optionally sub-sampling by stride and limiting count."""
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {path}")
+
+    frames: List[np.ndarray] = []
+    index = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if index % stride == 0:
+            frames.append(frame)
+            if max_frames and len(frames) >= max_frames:
+                break
+        index += 1
+    cap.release()
+    if not frames:
+        raise ValueError("No frames read from video")
+    return frames
+
+
+def write_video(
+    frames: Sequence[np.ndarray],
+    transforms: Sequence[np.ndarray],
+    canvas_size: Tuple[int, int],
+    offset: np.ndarray,
+    path: Path,
+    fps: float,
+    frame_postprocess: Callable[[np.ndarray], np.ndarray] | None = None,
+) -> None:
+    """Write stabilized video (not used in submission to avoid slowing down tests)"""
+    def apply_post(img: np.ndarray) -> np.ndarray:
+        return frame_postprocess(img) if frame_postprocess else img
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    first_frame = apply_post(warp_frame(frames[0], transforms[0], canvas_size, offset))
+    writer = cv2.VideoWriter(str(path), fourcc, fps, (first_frame.shape[1], first_frame.shape[0]))
+    writer.write(first_frame)
+
+    if len(frames) > 1:
+        for frame, T in zip(frames[1:], transforms[1:]):
+            warped = apply_post(warp_frame(frame, T, canvas_size, offset))
+            writer.write(warped)
+    writer.release()
 
 
 # ============================================================================
@@ -449,6 +513,101 @@ def align_all_panoramas(
     return aligned
 
 
+def render_strip_sweep_video(
+    frames: Sequence[np.ndarray],
+    transforms_smooth: Sequence[np.ndarray],
+    transforms_noisy: Sequence[np.ndarray],
+    canvas_size: Tuple[int, int],
+    offset: np.ndarray,
+    strip_ratio: float,
+    vertical_scale: float,
+    output_path: Path,
+    sweep_extent: float = 0.4,
+    steps: int = 60,
+    fps: float = 10,
+    downsample_targets: Sequence[Tuple[int, int]] | None = None,
+    convergence_click: Tuple[int, int] | None = None,
+    convergence_reference_index: int | None = None,
+    convergence_patch_radius: int = 20,
+) -> List[Tuple[Path, Tuple[int, int]]]:
+    """
+    Render a sweep video by varying the strip position with bounce effect.
+    Optionally applies convergence alignment and downsampling.
+    """
+    strip_locations = np.linspace(-abs(sweep_extent), abs(sweep_extent), steps)
+    # Build a bounce sequence so the sweep plays forward and then backward
+    strip_locations = np.concatenate([strip_locations, strip_locations[-2:0:-1]])
+
+    # Build all mosaics
+    mosaics: List[np.ndarray] = []
+    for center_ratio in strip_locations:
+        mosaic = build_mosaic(
+            frames,
+            transforms_smooth,
+            transforms_noisy,
+            strip_ratio,
+            canvas_size,
+            offset,
+            center_ratio,
+            vertical_scale,
+        )
+        mosaics.append(mosaic)
+
+    # Apply convergence alignment if requested
+    if convergence_click is not None:
+        ref_idx = convergence_reference_index if convergence_reference_index is not None else len(mosaics) // 2
+        mosaics = align_all_panoramas(
+            mosaics,
+            reference_index=ref_idx,
+            click_coords=convergence_click,
+            patch_radius=convergence_patch_radius,
+        )
+
+    # Write main video
+    h, w = mosaics[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+    if not writer.isOpened():
+        return []
+
+    for mosaic in mosaics:
+        writer.write(mosaic)
+    writer.release()
+
+    # Write downsampled versions
+    downsample_outputs: List[Tuple[Path, Tuple[int, int]]] = []
+    for target_w, target_h in downsample_targets or []:
+        if target_w <= 0 or target_h <= 0:
+            continue
+
+        scale = min(target_w / w, target_h / h, 1.0)
+        new_w = max(2, int(round(w * scale)))
+        new_h = max(2, int(round(h * scale)))
+        new_w = min(target_w, new_w)
+        new_h = min(target_h, new_h)
+
+        if new_w % 2 != 0:
+            new_w -= 1
+        if new_h % 2 != 0:
+            new_h -= 1
+
+        if new_w < 2 or new_h < 2:
+            continue
+
+        target_path = output_path.with_name(f"{output_path.stem}_{target_h}p{output_path.suffix}")
+        ds_writer = cv2.VideoWriter(str(target_path), fourcc, fps, (new_w, new_h))
+        if not ds_writer.isOpened():
+            continue
+
+        for mosaic in mosaics:
+            downsampled = cv2.resize(mosaic, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            ds_writer.write(downsampled)
+        ds_writer.release()
+        downsample_outputs.append((target_path, (new_w, new_h)))
+
+    return downsample_outputs
+
+
 # ============================================================================
 # Main Function for Submission
 # ============================================================================
@@ -509,24 +668,15 @@ def generate_panorama(input_frames_path, n_out_frames):
     strip_ratio = 0.06
     vertical_scale = 1.0
 
-    # Create sweep positions for n_out_frames with bounce effect
+    # Create sweep positions for n_out_frames
     baseline = 0.08  # Default stereo baseline
     sweep_extent = max(0.05, baseline * 2.5)
     
-    # Calculate steps to create forward sweep
+    # Generate exactly n_out_frames with linear sweep from left to right
     if n_out_frames == 1:
         strip_locations = [0.0]
     else:
-        # For bounce effect: go forward, then backward
-        # If n_out_frames is even, split equally
-        # If odd, favor forward direction
-        forward_steps = (n_out_frames + 1) // 2
-        strip_locations = list(np.linspace(-abs(sweep_extent), abs(sweep_extent), forward_steps))
-        # Add backward sweep (excluding endpoints to avoid duplication)
-        if forward_steps > 2:
-            strip_locations.extend(strip_locations[-2:0:-1])
-        # Trim to exact n_out_frames
-        strip_locations = strip_locations[:n_out_frames]
+        strip_locations = list(np.linspace(-abs(sweep_extent), abs(sweep_extent), n_out_frames))
 
     # Generate panorama frames
     panorama_frames = []
@@ -547,3 +697,298 @@ def generate_panorama(input_frames_path, n_out_frames):
         panorama_frames.append(pil_image)
 
     return panorama_frames
+
+
+# ============================================================================
+# Command-line Interface and Main Flow
+# ============================================================================
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Stereo mosaicing pipeline")
+    parser.add_argument("--input", required=True, type=Path, help="Input video path")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("output/mosaic.png"),
+        help="Output mosaic image path",
+    )
+    parser.add_argument(
+        "--stabilized-video",
+        type=Path,
+        default=None,
+        help="Optional path for stabilized preview video",
+    )
+    parser.add_argument(
+        "--max-frames", type=int, default=None, help="Optional cap on number of frames"
+    )
+    parser.add_argument(
+        "--stride", type=int, default=1, help="Frame stride for subsampling"
+    )
+    parser.add_argument(
+        "--strip-ratio", type=float, default=0.10, help="Strip width ratio"
+    )
+    parser.add_argument(
+        "--vertical-scale", type=float, default=1.0, help="Vertical scale factor"
+    )
+    parser.add_argument(
+        "--max-features", type=int, default=1000, help="feature budget per frame"
+    )
+    parser.add_argument(
+        "--blend-workers", type=int, default=0, help="Worker threads for strip blending"
+    )
+    parser.add_argument(
+        "--smooth-radius", type=int, default=25, help="Radius for trajectory smoothing"
+    )
+    parser.add_argument(
+        "--stereo-baseline-ratio",
+        type=float,
+        default=0.08,
+        help="Horizontal slit offset ratio (relative to frame width) for stereo pair",
+    )
+    parser.add_argument(
+        "--process-portrait",
+        action="store_true",
+        help="If the input video is portrait, rotate it 90 degrees CCW for processing and rotate outputs back to portrait",
+    )
+    parser.add_argument(
+        "--convergence-click",
+        type=int,
+        nargs=2,
+        metavar=("X", "Y"),
+        default=None,
+        help="Optional pixel (x y) in the reference sweep panorama to keep stationary",
+    )
+    parser.add_argument(
+        "--convergence-ref-index",
+        type=int,
+        default=None,
+        help="Optional reference panorama index for convergence alignment; defaults to the middle panorama",
+    )
+    parser.add_argument(
+        "--convergence-patch-radius",
+        type=int,
+        default=20,
+        help="Half-size of the square template patch used when locking the convergence point",
+    )
+    parser.add_argument(
+        "--save-outputs",
+        action="store_true",
+        help="Save output files (disabled by default for fast testing)",
+    )
+
+    return parser.parse_args()
+
+
+def generate_outputs(
+    frames,
+    global_stable,
+    global_noisy,
+    canvas_size,
+    offset,
+    args,
+    fps,
+    run_dir,
+    rotate_back_code=None,
+):
+    """Generate all outputs (mosaics, stereo pair, sweep video)"""
+    stereo_baseline = args.stereo_baseline_ratio
+
+    # Build main mosaic
+    mosaic = build_mosaic(
+        frames,
+        global_stable,
+        global_noisy,
+        args.strip_ratio,
+        canvas_size,
+        offset,
+        0.0,
+        args.vertical_scale,
+    )
+
+    # Build stereo pair
+    left = build_mosaic(
+        frames,
+        global_stable,
+        global_noisy,
+        args.strip_ratio,
+        canvas_size,
+        offset,
+        -stereo_baseline,
+        args.vertical_scale,
+    )
+    right = build_mosaic(
+        frames,
+        global_stable,
+        global_noisy,
+        args.strip_ratio,
+        canvas_size,
+        offset,
+        stereo_baseline,
+        args.vertical_scale,
+    )
+
+    def restore_orientation(img):
+        if rotate_back_code is None:
+            return img
+        return cv2.rotate(img, rotate_back_code)
+
+    mosaic = restore_orientation(mosaic)
+    left = restore_orientation(left)
+    right = restore_orientation(right)
+
+    # Apply zoom for stereo effect when convergence-click is supplied
+    if args.convergence_click:
+        zoom_factor = 1.3
+        
+        def zoom_image(img, factor):
+            h, w = img.shape[:2]
+            new_h, new_w = int(h / factor), int(w / factor)
+            y_start = (h - new_h) // 2
+            x_start = (w - new_w) // 2
+            cropped = img[y_start:y_start + new_h, x_start:x_start + new_w]
+            return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+        
+        mosaic = zoom_image(mosaic, zoom_factor)
+        left = zoom_image(left, zoom_factor)
+        right = zoom_image(right, zoom_factor)
+
+    # Save outputs only if requested
+    if args.save_outputs:
+        mosaic_path = run_dir / f"{args.input.stem}_mosaic.png"
+        cv2.imwrite(str(mosaic_path), mosaic)
+        print(f"Mosaic saved to: {mosaic_path}")
+
+        left_path = run_dir / f"{args.input.stem}_mosaic_L.png"
+        right_path = run_dir / f"{args.input.stem}_mosaic_R.png"
+        cv2.imwrite(str(left_path), left)
+        cv2.imwrite(str(right_path), right)
+        print(f"Stereo images saved to: {left_path}, {right_path}")
+
+        sweep_path = run_dir / f"{args.input.stem}_sweep.mp4"
+        downsampled_sweeps = render_strip_sweep_video(
+            frames,
+            global_stable,
+            global_noisy,
+            canvas_size,
+            offset,
+            strip_ratio=args.strip_ratio,
+            vertical_scale=args.vertical_scale,
+            output_path=sweep_path,
+            sweep_extent=max(0.05, stereo_baseline * 2.5),
+            steps=10,
+            fps=max(10.0, fps),
+            downsample_targets=[(1280, 720), (1920, 1080)],
+            convergence_click=tuple(args.convergence_click) if args.convergence_click else None,
+            convergence_reference_index=args.convergence_ref_index,
+            convergence_patch_radius=args.convergence_patch_radius,
+        )
+        print(f"Sweep video saved to: {sweep_path}")
+        for ds_path, (ds_w, ds_h) in downsampled_sweeps:
+            print(f"Downsampled sweep saved to: {ds_path} ({ds_w}x{ds_h})")
+    else:
+        print("Output generation complete (files not saved - use --save-outputs to save)")
+
+    return mosaic, left, right
+
+
+def main() -> None:
+    """Main entry point with complete processing flow"""
+    args = parse_args()
+    frames = read_video_frames(
+        args.input, max_frames=args.max_frames, stride=args.stride
+    )
+    if not frames:
+        raise RuntimeError("No frames loaded; check input path and stride/max-frames settings")
+
+    h, w = frames[0].shape[:2]
+    print(f"Loaded {len(frames)} frames from {args.input} at {w}x{h} (stride={args.stride}, max={args.max_frames})")
+    fps = cv2.VideoCapture(str(args.input)).get(cv2.CAP_PROP_FPS) or 25.0
+
+    rotate_back_code = None
+    if args.process_portrait:
+        print("Process-portrait requested; rotating 90 degrees CCW for processing.")
+        frames = [cv2.rotate(f, cv2.ROTATE_90_COUNTERCLOCKWISE) for f in frames]
+        rotate_back_code = cv2.ROTATE_90_CLOCKWISE
+
+    # Create output directory only if saving
+    run_dir = None
+    if args.save_outputs:
+        run_dir = (
+            Path("output") / f"{args.input.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        run_dir.mkdir(parents=True, exist_ok=True)
+        
+        args_out = run_dir / "args.txt"
+        with args_out.open("w", encoding="utf-8") as f:
+            for k, v in sorted(vars(args).items()):
+                f.write(f"{k}: {v}\n")
+    else:
+        run_dir = Path("output")  # Dummy path, won't be used
+
+    # Process frames
+    print("Computing pairwise transformations...")
+    pairwise = pairwise_transforms(
+        frames,
+        max_features=args.max_features,
+        ransac_thresh=1.5,
+    )
+
+    print("Canceling cumulative rotation...")
+    pairwise = cancel_cumulative_rotation(pairwise)
+
+    print("Computing global transformations...")
+    global_full = local_to_global_transformations(pairwise)
+    
+    print("Detrending video for stabilization...")
+    global_noisy, global_stable = detrend_video(
+        global_full,
+        smooth_radius=args.smooth_radius,
+        smooth_x=False,
+        smooth_y=True,
+        smooth_angle=True,
+        smooth_scale=False,
+        detrend_y=True,
+        detrend_angle=True,
+    )
+
+    print("Computing canvas bounds...")
+    canvas_size, offset = compute_canvas_bounds(frames, global_stable)
+    print(f"Canvas size {canvas_size}, offset {offset}")
+
+    print("Generating outputs...")
+    generate_outputs(
+        frames,
+        global_stable,
+        global_noisy,
+        canvas_size,
+        offset,
+        args,
+        fps,
+        run_dir,
+        rotate_back_code,
+    )
+
+    if args.stabilized_video and args.save_outputs:
+        print("Writing stabilized video...")
+        stabilized_path = Path(args.stabilized_video)
+        frame_postprocess = (
+            (lambda img: cv2.rotate(img, rotate_back_code))
+            if rotate_back_code is not None
+            else None
+        )
+        write_video(
+            frames,
+            global_noisy,
+            canvas_size,
+            offset,
+            stabilized_path,
+            fps=fps,
+            frame_postprocess=frame_postprocess,
+        )
+        print(f"Stabilized video saved to: {stabilized_path}")
+
+    print("Done!")
+
+
+if __name__ == "__main__":
+    main()
